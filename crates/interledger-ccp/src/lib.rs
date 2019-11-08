@@ -9,12 +9,10 @@
 //! updates are used by the `Router` to forward incoming packets to the best next hop
 //! we know about.
 
-use bytes::Bytes;
 use futures::Future;
-use interledger_ildcp::IldcpAccount;
 use interledger_service::Account;
 use std::collections::HashMap;
-use std::{str::FromStr, string::ToString};
+use std::{fmt, str::FromStr};
 
 #[cfg(test)]
 mod fixtures;
@@ -24,13 +22,25 @@ mod server;
 #[cfg(test)]
 mod test_helpers;
 
+pub use packet::{Mode, RouteControlRequest};
 pub use server::{CcpRouteManager, CcpRouteManagerBuilder};
 
+use serde::{Deserialize, Serialize};
+
+/// Data structure used to describe the routing relation of an account with its peers.
 #[repr(u8)]
-#[derive(Clone, Copy, Debug, PartialEq, PartialOrd)]
+#[derive(Clone, Copy, Debug, PartialEq, PartialOrd, Serialize, Deserialize)]
 pub enum RoutingRelation {
+    /// An account from which we do not receive routes from, neither broadcast
+    /// routes to
+    NonRoutingAccount = 0,
+    /// An account from which we receive routes from, but do not broadcast
+    /// routes to
     Parent = 1,
+    /// An account from which we receive routes from and broadcast routes to
     Peer = 2,
+    /// An account from which we do not receive routes from, but broadcast
+    /// routes to
     Child = 3,
 }
 
@@ -39,6 +49,7 @@ impl FromStr for RoutingRelation {
 
     fn from_str(string: &str) -> Result<Self, ()> {
         match string.to_lowercase().as_str() {
+            "nonroutingaccount" => Ok(RoutingRelation::NonRoutingAccount),
             "parent" => Ok(RoutingRelation::Parent),
             "peer" => Ok(RoutingRelation::Peer),
             "child" => Ok(RoutingRelation::Child),
@@ -47,35 +58,44 @@ impl FromStr for RoutingRelation {
     }
 }
 
-impl ToString for RoutingRelation {
-    fn to_string(&self) -> String {
+impl AsRef<str> for RoutingRelation {
+    fn as_ref(&self) -> &'static str {
         match self {
-            RoutingRelation::Parent => "Parent".to_string(),
-            RoutingRelation::Peer => "Peer".to_string(),
-            RoutingRelation::Child => "Child".to_string(),
+            RoutingRelation::NonRoutingAccount => "NonRoutingAccount",
+            RoutingRelation::Parent => "Parent",
+            RoutingRelation::Peer => "Peer",
+            RoutingRelation::Child => "Child",
         }
     }
 }
 
-/// DefineCcpAccountethods Account types need to be used by the CCP Service
-pub trait CcpRoutingAccount: Account + IldcpAccount {
+impl fmt::Display for RoutingRelation {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "{}", self.as_ref())
+    }
+}
+
+/// Define CcpAccount methods and Account types that need to be used by the CCP Service
+pub trait CcpRoutingAccount: Account {
     /// The type of relationship we have with this account
     fn routing_relation(&self) -> RoutingRelation;
 
     /// Indicates whether we should send CCP Route Updates to this account
     fn should_send_routes(&self) -> bool {
-        false
+        self.routing_relation() == RoutingRelation::Child
+            || self.routing_relation() == RoutingRelation::Peer
     }
 
     /// Indicates whether we should accept CCP Route Update Requests from this account
     fn should_receive_routes(&self) -> bool {
-        false
+        self.routing_relation() == RoutingRelation::Parent
+            || self.routing_relation() == RoutingRelation::Peer
     }
 }
 
 // key = Bytes, key should be Address -- TODO
-type Route<T> = HashMap<Bytes, T>;
-type LocalAndConfiguredRoutes<T> = (Route<T>, Route<T>);
+type Routes<T> = HashMap<String, T>;
+type LocalAndConfiguredRoutes<T> = (Routes<T>, Routes<T>);
 
 pub trait RouteManagerStore: Clone {
     type Account: CcpRoutingAccount;
@@ -87,6 +107,7 @@ pub trait RouteManagerStore: Clone {
 
     fn get_accounts_to_send_routes_to(
         &self,
+        ignore_accounts: Vec<<Self::Account as Account>::AccountId>,
     ) -> Box<dyn Future<Item = Vec<Self::Account>, Error = ()> + Send>;
 
     fn get_accounts_to_receive_routes_from(
@@ -95,6 +116,6 @@ pub trait RouteManagerStore: Clone {
 
     fn set_routes(
         &mut self,
-        routes: impl IntoIterator<Item = (Bytes, Self::Account)>,
+        routes: impl IntoIterator<Item = (String, Self::Account)>,
     ) -> Box<dyn Future<Item = (), Error = ()> + Send>;
 }

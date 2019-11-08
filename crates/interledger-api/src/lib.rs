@@ -1,103 +1,236 @@
-#![recursion_limit = "128"]
-#[macro_use]
-extern crate tower_web;
-
 use bytes::Bytes;
 use futures::Future;
 use interledger_http::{HttpAccount, HttpStore};
-use interledger_ildcp::IldcpAccount;
 use interledger_packet::Address;
 use interledger_router::RouterStore;
-use interledger_service::{Account as AccountTrait, IncomingService};
+use interledger_service::{Account, AddressStore, IncomingService, OutgoingService, Username};
 use interledger_service_util::{BalanceStore, ExchangeRateStore};
 use interledger_settlement::{SettlementAccount, SettlementStore};
-use serde::Serialize;
-use std::str;
-use tower_web::{net::ConnectionStream, Extract, Response, ServiceBuilder};
-
+use interledger_stream::StreamNotificationsStore;
+use serde::{de, Deserialize, Serialize};
+use std::{boxed::*, collections::HashMap, fmt::Display, net::SocketAddr, str::FromStr};
+use warp::{self, Filter};
 mod routes;
-use self::routes::*;
+use interledger_btp::{BtpAccount, BtpOutgoingService};
+use interledger_ccp::CcpRoutingAccount;
+use secrecy::SecretString;
+use url::Url;
 
-pub(crate) const BEARER_TOKEN_START: usize = 7;
+pub(crate) mod http_retry;
 
-pub trait NodeStore: Clone + Send + Sync + 'static {
-    type Account: AccountTrait;
+// This enum and the following functions are used to allow clients to send either
+// numbers or strings and have them be properly deserialized into the appropriate
+// integer type.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum NumOrStr<T> {
+    Num(T),
+    Str(String),
+}
+
+pub fn number_or_string<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    D: de::Deserializer<'de>,
+    T: FromStr + Deserialize<'de>,
+    <T as FromStr>::Err: Display,
+{
+    match NumOrStr::deserialize(deserializer)? {
+        NumOrStr::Num(n) => Ok(n),
+        NumOrStr::Str(s) => T::from_str(&s).map_err(de::Error::custom),
+    }
+}
+
+pub fn optional_number_or_string<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: de::Deserializer<'de>,
+    T: FromStr + Deserialize<'de>,
+    <T as FromStr>::Err: Display,
+{
+    match NumOrStr::deserialize(deserializer)? {
+        NumOrStr::Num(n) => Ok(Some(n)),
+        NumOrStr::Str(s) => T::from_str(&s)
+            .map_err(de::Error::custom)
+            .and_then(|n| Ok(Some(n))),
+    }
+}
+
+pub fn map_of_number_or_string<'de, D>(deserializer: D) -> Result<HashMap<String, f64>, D::Error>
+where
+    D: de::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    struct Wrapper(#[serde(deserialize_with = "number_or_string")] f64);
+
+    let v = HashMap::<String, Wrapper>::deserialize(deserializer)?;
+    Ok(v.into_iter().map(|(k, Wrapper(v))| (k, v)).collect())
+}
+
+// TODO should the methods from this trait be split up and put into the
+// traits that are more specific to what they're doing?
+// One argument against doing that is that the NodeStore allows admin-only
+// modifications to the values, whereas many of the other traits mostly
+// read from the configured values.
+pub trait NodeStore: AddressStore + Clone + Send + Sync + 'static {
+    type Account: Account;
 
     fn insert_account(
         &self,
         account: AccountDetails,
     ) -> Box<dyn Future<Item = Self::Account, Error = ()> + Send>;
 
-    fn remove_account(
+    fn delete_account(
         &self,
-        id: <Self::Account as AccountTrait>::AccountId,
+        id: <Self::Account as Account>::AccountId,
+    ) -> Box<dyn Future<Item = Self::Account, Error = ()> + Send>;
+
+    fn update_account(
+        &self,
+        id: <Self::Account as Account>::AccountId,
+        account: AccountDetails,
+    ) -> Box<dyn Future<Item = Self::Account, Error = ()> + Send>;
+
+    fn modify_account_settings(
+        &self,
+        id: <Self::Account as Account>::AccountId,
+        settings: AccountSettings,
     ) -> Box<dyn Future<Item = Self::Account, Error = ()> + Send>;
 
     // TODO limit the number of results and page through them
     fn get_all_accounts(&self) -> Box<dyn Future<Item = Vec<Self::Account>, Error = ()> + Send>;
 
-    fn set_rates<R>(&self, rates: R) -> Box<dyn Future<Item = (), Error = ()> + Send>
-    where
-        R: IntoIterator<Item = (String, f64)>;
-
     fn set_static_routes<R>(&self, routes: R) -> Box<dyn Future<Item = (), Error = ()> + Send>
     where
-        R: IntoIterator<Item = (String, <Self::Account as AccountTrait>::AccountId)>;
+        R: IntoIterator<Item = (String, <Self::Account as Account>::AccountId)>;
 
     fn set_static_route(
         &self,
         prefix: String,
-        account_id: <Self::Account as AccountTrait>::AccountId,
+        account_id: <Self::Account as Account>::AccountId,
     ) -> Box<dyn Future<Item = (), Error = ()> + Send>;
+
+    fn set_default_route(
+        &self,
+        account_id: <Self::Account as Account>::AccountId,
+    ) -> Box<dyn Future<Item = (), Error = ()> + Send>;
+
+    fn set_settlement_engines(
+        &self,
+        asset_to_url_map: impl IntoIterator<Item = (String, Url)>,
+    ) -> Box<dyn Future<Item = (), Error = ()> + Send>;
+
+    fn get_asset_settlement_engine(
+        &self,
+        asset_code: &str,
+    ) -> Box<dyn Future<Item = Option<Url>, Error = ()> + Send>;
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExchangeRates(
+    #[serde(deserialize_with = "map_of_number_or_string")] HashMap<String, f64>,
+);
+
+/// AccountSettings is a subset of the user parameters defined in
+/// AccountDetails. Its purpose is to allow a user to modify certain of their
+/// parameters which they may want to re-configure in the future, such as their
+/// tokens (which act as passwords), their settlement frequency preferences, or
+/// their HTTP/BTP endpoints, since they may change their network configuration.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AccountSettings {
+    pub ilp_over_http_incoming_token: Option<SecretString>,
+    pub ilp_over_btp_incoming_token: Option<SecretString>,
+    pub ilp_over_http_outgoing_token: Option<SecretString>,
+    pub ilp_over_btp_outgoing_token: Option<SecretString>,
+    pub ilp_over_http_url: Option<String>,
+    pub ilp_over_btp_url: Option<String>,
+    #[serde(default, deserialize_with = "optional_number_or_string")]
+    pub settle_threshold: Option<i64>,
+    // Note that this is intentionally an unsigned integer because users should
+    // not be able to set the settle_to value to be negative (meaning the node
+    // would pre-fund with the user)
+    #[serde(default, deserialize_with = "optional_number_or_string")]
+    pub settle_to: Option<u64>,
+}
+
+/// EncryptedAccountSettings is created by encrypting the incoming and outgoing
+/// HTTP and BTP tokens of an AccountSettings object. The rest of the fields
+/// remain the same. It is intended to be consumed by the internal store
+/// implementation which operates only on encrypted data.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct EncryptedAccountSettings {
+    pub ilp_over_http_incoming_token: Option<Bytes>,
+    pub ilp_over_btp_incoming_token: Option<Bytes>,
+    pub ilp_over_http_outgoing_token: Option<Bytes>,
+    pub ilp_over_btp_outgoing_token: Option<Bytes>,
+    pub ilp_over_http_url: Option<String>,
+    pub ilp_over_btp_url: Option<String>,
+    #[serde(default, deserialize_with = "optional_number_or_string")]
+    pub settle_threshold: Option<i64>,
+    #[serde(default, deserialize_with = "optional_number_or_string")]
+    pub settle_to: Option<u64>,
 }
 
 /// The Account type for the RedisStore.
-#[derive(Debug, Extract, Response, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AccountDetails {
-    pub ilp_address: Address,
+    pub ilp_address: Option<Address>,
+    pub username: Username,
     pub asset_code: String,
+    #[serde(deserialize_with = "number_or_string")]
     pub asset_scale: u8,
-    #[serde(default = "u64::max_value")]
+    #[serde(default = "u64::max_value", deserialize_with = "number_or_string")]
     pub max_packet_amount: u64,
+    #[serde(default, deserialize_with = "optional_number_or_string")]
     pub min_balance: Option<i64>,
-    pub http_endpoint: Option<String>,
-    pub http_incoming_token: Option<String>,
-    pub http_outgoing_token: Option<String>,
-    pub btp_uri: Option<String>,
-    pub btp_incoming_token: Option<String>,
+    pub ilp_over_http_url: Option<String>,
+    pub ilp_over_http_incoming_token: Option<SecretString>,
+    pub ilp_over_http_outgoing_token: Option<SecretString>,
+    pub ilp_over_btp_url: Option<String>,
+    pub ilp_over_btp_outgoing_token: Option<SecretString>,
+    pub ilp_over_btp_incoming_token: Option<SecretString>,
+    #[serde(default, deserialize_with = "optional_number_or_string")]
     pub settle_threshold: Option<i64>,
+    #[serde(default, deserialize_with = "optional_number_or_string")]
     pub settle_to: Option<i64>,
-    #[serde(default)]
-    pub send_routes: bool,
-    #[serde(default)]
-    pub receive_routes: bool,
     pub routing_relation: Option<String>,
-    pub round_trip_time: Option<u64>,
+    #[serde(default, deserialize_with = "optional_number_or_string")]
+    pub round_trip_time: Option<u32>,
+    #[serde(default, deserialize_with = "optional_number_or_string")]
     pub amount_per_minute_limit: Option<u64>,
+    #[serde(default, deserialize_with = "optional_number_or_string")]
     pub packets_per_minute_limit: Option<u32>,
     pub settlement_engine_url: Option<String>,
 }
 
-pub struct NodeApi<S, I> {
+pub struct NodeApi<S, I, O, B, A: Account> {
     store: S,
     admin_api_token: String,
-    default_spsp_account: Option<String>,
+    default_spsp_account: Option<Username>,
     incoming_handler: I,
+    // The outgoing service is included so that the API can send outgoing
+    // requests to specific accounts (namely ILDCP requests)
+    outgoing_handler: O,
+    // The BTP service is included here so that we can add a new client
+    // connection when an account is added with BTP details
+    btp: BtpOutgoingService<B, A>,
     server_secret: Bytes,
 }
 
-impl<S, I, A> NodeApi<S, I>
+impl<S, I, O, B, A> NodeApi<S, I, O, B, A>
 where
     S: NodeStore<Account = A>
         + HttpStore<Account = A>
         + BalanceStore<Account = A>
         + SettlementStore<Account = A>
+        + StreamNotificationsStore<Account = A>
         + RouterStore
         + ExchangeRateStore,
     I: IncomingService<A> + Clone + Send + Sync + 'static,
-    A: AccountTrait
+    O: OutgoingService<A> + Clone + Send + Sync + 'static,
+    B: OutgoingService<A> + Clone + Send + Sync + 'static,
+    A: BtpAccount
+        + CcpRoutingAccount
+        + Account
         + HttpAccount
-        + IldcpAccount
         + SettlementAccount
         + Serialize
         + Send
@@ -109,50 +242,120 @@ where
         admin_api_token: String,
         store: S,
         incoming_handler: I,
+        outgoing_handler: O,
+        btp: BtpOutgoingService<B, A>,
     ) -> Self {
         NodeApi {
             store,
             admin_api_token,
             default_spsp_account: None,
             incoming_handler,
+            outgoing_handler,
+            btp,
             server_secret,
         }
     }
 
-    pub fn default_spsp_account(&mut self, account_id: String) -> &mut Self {
-        self.default_spsp_account = Some(account_id);
+    pub fn default_spsp_account(&mut self, username: Username) -> &mut Self {
+        self.default_spsp_account = Some(username);
         self
     }
 
-    pub fn serve<T>(&self, incoming: T) -> impl Future<Item = (), Error = ()>
-    where
-        T: ConnectionStream,
-        T::Item: Send + 'static,
-    {
-        ServiceBuilder::new()
-            .resource(IlpApi::new(
-                self.store.clone(),
-                self.incoming_handler.clone(),
-            ))
-            .resource({
-                let mut spsp = SpspApi::new(
-                    self.server_secret.clone(),
-                    self.store.clone(),
-                    self.incoming_handler.clone(),
-                );
-                if let Some(account_id) = &self.default_spsp_account {
-                    spsp.default_spsp_account(account_id.clone());
-                }
-                spsp
-            })
-            .resource(AccountsApi::new(
-                self.admin_api_token.clone(),
-                self.store.clone(),
-            ))
-            .resource(SettingsApi::new(
-                self.admin_api_token.clone(),
-                self.store.clone(),
-            ))
-            .serve(incoming)
+    pub fn into_warp_filter(self) -> warp::filters::BoxedFilter<(impl warp::Reply,)> {
+        routes::accounts_api(
+            self.server_secret,
+            self.admin_api_token.clone(),
+            self.default_spsp_account,
+            self.incoming_handler,
+            self.outgoing_handler,
+            self.btp,
+            self.store.clone(),
+        )
+        .or(routes::node_settings_api(self.admin_api_token, self.store))
+        .boxed()
+    }
+
+    pub fn bind(self, addr: SocketAddr) -> impl Future<Item = (), Error = ()> {
+        warp::serve(self.into_warp_filter()).bind(addr)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::{self, json};
+
+    #[test]
+    fn number_or_string_deserialization() {
+        #[derive(PartialEq, Deserialize, Debug)]
+        struct One {
+            #[serde(deserialize_with = "number_or_string")]
+            val: u64,
+        }
+        assert_eq!(
+            serde_json::from_str::<One>("{\"val\":1}").unwrap(),
+            One { val: 1 }
+        );
+        assert_eq!(
+            serde_json::from_str::<One>("{\"val\":\"1\"}").unwrap(),
+            One { val: 1 }
+        );
+
+        assert!(serde_json::from_str::<One>("{\"val\":\"not-a-number\"}").is_err());
+        assert!(serde_json::from_str::<One>("{\"val\":\"-1\"}").is_err());
+    }
+
+    #[test]
+    fn optional_number_or_string_deserialization() {
+        #[derive(PartialEq, Deserialize, Debug)]
+        struct One {
+            #[serde(deserialize_with = "optional_number_or_string")]
+            val: Option<u64>,
+        }
+        assert_eq!(
+            serde_json::from_str::<One>("{\"val\":1}").unwrap(),
+            One { val: Some(1) }
+        );
+        assert_eq!(
+            serde_json::from_str::<One>("{\"val\":\"1\"}").unwrap(),
+            One { val: Some(1) }
+        );
+        assert!(serde_json::from_str::<One>("{}").is_err());
+
+        #[derive(PartialEq, Deserialize, Debug)]
+        struct Two {
+            #[serde(default, deserialize_with = "optional_number_or_string")]
+            val: Option<u64>,
+        }
+        assert_eq!(
+            serde_json::from_str::<Two>("{\"val\":2}").unwrap(),
+            Two { val: Some(2) }
+        );
+        assert_eq!(
+            serde_json::from_str::<Two>("{\"val\":\"2\"}").unwrap(),
+            Two { val: Some(2) }
+        );
+        assert_eq!(
+            serde_json::from_str::<Two>("{}").unwrap(),
+            Two { val: None }
+        );
+    }
+
+    #[test]
+    fn account_settings_deserialization() {
+        let settings: AccountSettings = serde_json::from_value(json!({
+            "ilp_over_http_url": "https://example.com/ilp",
+            "ilp_over_http_incoming_token": "secret",
+            "settle_to": 0,
+            "settle_threshold": "1000",
+        }))
+        .unwrap();
+        assert_eq!(settings.settle_threshold, Some(1000));
+        assert_eq!(settings.settle_to, Some(0));
+        assert_eq!(
+            settings.ilp_over_http_url,
+            Some("https://example.com/ilp".to_string())
+        );
+        assert!(settings.ilp_over_btp_url.is_none());
     }
 }

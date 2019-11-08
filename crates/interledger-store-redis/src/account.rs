@@ -4,31 +4,37 @@ use interledger_api::AccountDetails;
 use interledger_btp::BtpAccount;
 use interledger_ccp::{CcpRoutingAccount, RoutingRelation};
 use interledger_http::HttpAccount;
-use interledger_ildcp::IldcpAccount;
 use interledger_packet::Address;
-use interledger_service::Account as AccountTrait;
+use interledger_service::{Account as AccountTrait, Username};
 use interledger_service_util::{
     MaxPacketAmountAccount, RateLimitAccount, RoundTripTimeAccount, DEFAULT_ROUND_TRIP_TIME,
 };
 use interledger_settlement::{SettlementAccount, SettlementEngineDetails};
 use log::error;
-use redis::{from_redis_value, ErrorKind, FromRedisValue, RedisError, ToRedisArgs, Value};
+use redis::{
+    from_redis_value, ErrorKind, FromRedisValue, RedisError, RedisWrite, ToRedisArgs, Value,
+};
 
 use ring::aead;
-use serde::Serialize;
 use serde::Serializer;
+use serde::{Deserialize, Serialize};
+use std::fmt::Display;
 use std::{
     collections::HashMap,
-    convert::TryFrom,
     str::{self, FromStr},
 };
+use uuid::{parser::ParseError, Uuid};
 
 use url::Url;
 const ACCOUNT_DETAILS_FIELDS: usize = 21;
 
-#[derive(Clone, Debug, Serialize)]
+use secrecy::ExposeSecret;
+use secrecy::SecretBytes;
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Account {
-    pub(crate) id: u64,
+    pub(crate) id: AccountId,
+    pub(crate) username: Username,
     #[serde(serialize_with = "address_to_string")]
     pub(crate) ilp_address: Address,
     // TODO add additional routes
@@ -36,24 +42,22 @@ pub struct Account {
     pub(crate) asset_scale: u8,
     pub(crate) max_packet_amount: u64,
     pub(crate) min_balance: Option<i64>,
-    #[serde(serialize_with = "optional_url_to_string")]
-    pub(crate) http_endpoint: Option<Url>,
-    #[serde(serialize_with = "optional_bytes_to_utf8")]
-    pub(crate) http_outgoing_token: Option<Bytes>,
-    #[serde(serialize_with = "optional_url_to_string")]
-    pub(crate) btp_uri: Option<Url>,
-    #[serde(serialize_with = "optional_bytes_to_utf8")]
-    pub(crate) btp_outgoing_token: Option<Bytes>,
+    pub(crate) ilp_over_http_url: Option<Url>,
+    #[serde(serialize_with = "optional_secret_bytes_to_utf8")]
+    pub(crate) ilp_over_http_incoming_token: Option<SecretBytes>,
+    #[serde(serialize_with = "optional_secret_bytes_to_utf8")]
+    pub(crate) ilp_over_http_outgoing_token: Option<SecretBytes>,
+    pub(crate) ilp_over_btp_url: Option<Url>,
+    #[serde(serialize_with = "optional_secret_bytes_to_utf8")]
+    pub(crate) ilp_over_btp_incoming_token: Option<SecretBytes>,
+    #[serde(serialize_with = "optional_secret_bytes_to_utf8")]
+    pub(crate) ilp_over_btp_outgoing_token: Option<SecretBytes>,
     pub(crate) settle_threshold: Option<i64>,
     pub(crate) settle_to: Option<i64>,
-    #[serde(serialize_with = "routing_relation_to_string")]
     pub(crate) routing_relation: RoutingRelation,
-    pub(crate) send_routes: bool,
-    pub(crate) receive_routes: bool,
-    pub(crate) round_trip_time: u64,
+    pub(crate) round_trip_time: u32,
     pub(crate) packets_per_minute_limit: Option<u32>,
     pub(crate) amount_per_minute_limit: Option<u64>,
-    #[serde(serialize_with = "optional_url_to_string")]
     pub(crate) settlement_engine_url: Option<Url>,
 }
 
@@ -64,59 +68,50 @@ where
     serializer.serialize_str(str::from_utf8(address.as_ref()).unwrap_or(""))
 }
 
-fn optional_bytes_to_utf8<S>(bytes: &Option<Bytes>, serializer: S) -> Result<S::Ok, S::Error>
-where
-    S: Serializer,
-{
-    if let Some(bytes) = bytes {
-        serializer.serialize_some(str::from_utf8(bytes.as_ref()).unwrap_or(""))
-    } else {
-        serializer.serialize_none()
-    }
-}
-
-fn optional_url_to_string<S>(url: &Option<Url>, serializer: S) -> Result<S::Ok, S::Error>
-where
-    S: Serializer,
-{
-    if let Some(ref url) = url {
-        serializer.serialize_str(url.as_ref())
-    } else {
-        serializer.serialize_none()
-    }
-}
-
-// This needs to be pass by ref because serde expects this function to take a ref
-#[allow(clippy::trivially_copy_pass_by_ref)]
-fn routing_relation_to_string<S>(
-    relation: &RoutingRelation,
+fn optional_secret_bytes_to_utf8<S>(
+    _bytes: &Option<SecretBytes>,
     serializer: S,
 ) -> Result<S::Ok, S::Error>
 where
     S: Serializer,
 {
-    serializer.serialize_str(relation.to_string().as_str())
+    serializer.serialize_str("SECRET")
 }
 
 impl Account {
-    pub fn try_from(id: u64, details: AccountDetails) -> Result<Account, ()> {
-        let http_endpoint = if let Some(ref url) = details.http_endpoint {
+    pub fn try_from(
+        id: AccountId,
+        details: AccountDetails,
+        node_ilp_address: Address,
+    ) -> Result<Account, ()> {
+        let ilp_address = match details.ilp_address {
+            Some(a) => a,
+            None => node_ilp_address
+                .with_suffix(details.username.as_bytes())
+                .map_err(|_| {
+                    error!(
+                        "Could not append username {} to address {}",
+                        details.username, node_ilp_address
+                    )
+                })?,
+        };
+
+        let ilp_over_http_url = if let Some(ref url) = details.ilp_over_http_url {
             Some(Url::parse(url).map_err(|err| error!("Invalid URL: {:?}", err))?)
         } else {
             None
         };
-        let (btp_uri, btp_outgoing_token) = if let Some(ref url) = details.btp_uri {
-            let mut btp_uri = Url::parse(url).map_err(|err| error!("Invalid URL: {:?}", err))?;
-            let btp_outgoing_token = btp_uri.password().map(Bytes::from);
-            btp_uri.set_password(None).unwrap();
-            (Some(btp_uri), btp_outgoing_token)
+
+        let ilp_over_btp_url = if let Some(ref url) = details.ilp_over_btp_url {
+            Some(Url::parse(url).map_err(|err| error!("Invalid URL: {:?}", err))?)
         } else {
-            (None, None)
+            None
         };
+
         let routing_relation = if let Some(ref relation) = details.routing_relation {
             RoutingRelation::from_str(relation)?
         } else {
-            RoutingRelation::Child
+            RoutingRelation::NonRoutingAccount
         };
         let settlement_engine_url =
             if let Some(settlement_engine_url) = details.settlement_engine_url {
@@ -124,23 +119,31 @@ impl Account {
             } else {
                 None
             };
+
         Ok(Account {
             id,
-            ilp_address: Address::try_from(details.ilp_address.as_ref()).map_err(|err| {
-                error!("Invalid ILP Address when creating Redis account: {:?}", err)
-            })?,
+            username: details.username,
+            ilp_address,
             asset_code: details.asset_code.to_uppercase(),
             asset_scale: details.asset_scale,
             max_packet_amount: details.max_packet_amount,
             min_balance: details.min_balance,
-            http_endpoint,
-            http_outgoing_token: details.http_outgoing_token.map(Bytes::from),
-            btp_uri,
-            btp_outgoing_token,
-            settle_threshold: details.settle_threshold,
+            ilp_over_http_url,
+            ilp_over_http_incoming_token: details
+                .ilp_over_http_incoming_token
+                .map(|token| SecretBytes::new(token.expose_secret().to_string())),
+            ilp_over_http_outgoing_token: details
+                .ilp_over_http_outgoing_token
+                .map(|token| SecretBytes::new(token.expose_secret().to_string())),
+            ilp_over_btp_url,
+            ilp_over_btp_incoming_token: details
+                .ilp_over_btp_incoming_token
+                .map(|token| SecretBytes::new(token.expose_secret().to_string())),
+            ilp_over_btp_outgoing_token: details
+                .ilp_over_btp_outgoing_token
+                .map(|token| SecretBytes::new(token.expose_secret().to_string())),
             settle_to: details.settle_to,
-            send_routes: details.send_routes,
-            receive_routes: details.receive_routes,
+            settle_threshold: details.settle_threshold,
             routing_relation,
             round_trip_time: details.round_trip_time.unwrap_or(DEFAULT_ROUND_TRIP_TIME),
             packets_per_minute_limit: details.packets_per_minute_limit,
@@ -151,42 +154,149 @@ impl Account {
 
     pub fn encrypt_tokens(
         mut self,
-        encryption_key: &aead::SealingKey,
+        encryption_key: &aead::LessSafeKey,
     ) -> AccountWithEncryptedTokens {
-        if let Some(ref token) = self.btp_outgoing_token {
-            self.btp_outgoing_token = Some(encrypt_token(encryption_key, token));
+        if let Some(ref token) = self.ilp_over_btp_outgoing_token {
+            self.ilp_over_btp_outgoing_token = Some(SecretBytes::from(encrypt_token(
+                encryption_key,
+                &token.expose_secret(),
+            )));
         }
-        if let Some(ref token) = self.http_outgoing_token {
-            self.http_outgoing_token = Some(encrypt_token(encryption_key, token));
+        if let Some(ref token) = self.ilp_over_http_outgoing_token {
+            self.ilp_over_http_outgoing_token = Some(SecretBytes::from(encrypt_token(
+                encryption_key,
+                &token.expose_secret(),
+            )));
+        }
+        if let Some(ref token) = self.ilp_over_btp_incoming_token {
+            self.ilp_over_btp_incoming_token = Some(SecretBytes::from(encrypt_token(
+                encryption_key,
+                &token.expose_secret(),
+            )));
+        }
+        if let Some(ref token) = self.ilp_over_http_incoming_token {
+            self.ilp_over_http_incoming_token = Some(SecretBytes::from(encrypt_token(
+                encryption_key,
+                &token.expose_secret(),
+            )));
         }
         AccountWithEncryptedTokens { account: self }
     }
 }
 
+#[derive(Debug, Clone)]
 pub struct AccountWithEncryptedTokens {
-    account: Account,
+    pub(super) account: Account,
 }
 
 impl AccountWithEncryptedTokens {
-    pub fn decrypt_tokens(mut self, decryption_key: &aead::OpeningKey) -> Account {
-        if let Some(ref encrypted) = self.account.btp_outgoing_token {
-            self.account.btp_outgoing_token = decrypt_token(decryption_key, encrypted);
+    pub fn decrypt_tokens(mut self, decryption_key: &aead::LessSafeKey) -> Account {
+        if let Some(ref encrypted) = self.account.ilp_over_btp_outgoing_token {
+            self.account.ilp_over_btp_outgoing_token =
+                decrypt_token(decryption_key, &encrypted.expose_secret())
+                    .map_err(|_| {
+                        error!(
+                            "Unable to decrypt ilp_over_btp_outgoing_token for account {}",
+                            self.account.id
+                        )
+                    })
+                    .ok();
         }
-        if let Some(ref encrypted) = self.account.http_outgoing_token {
-            self.account.http_outgoing_token = decrypt_token(decryption_key, encrypted);
+        if let Some(ref encrypted) = self.account.ilp_over_http_outgoing_token {
+            self.account.ilp_over_http_outgoing_token =
+                decrypt_token(decryption_key, &encrypted.expose_secret())
+                    .map_err(|_| {
+                        error!(
+                            "Unable to decrypt ilp_over_http_outgoing_token for account {}",
+                            self.account.id
+                        )
+                    })
+                    .ok();
+        }
+        if let Some(ref encrypted) = self.account.ilp_over_btp_incoming_token {
+            self.account.ilp_over_btp_incoming_token =
+                decrypt_token(decryption_key, &encrypted.expose_secret())
+                    .map_err(|_| {
+                        error!(
+                            "Unable to decrypt ilp_over_btp_incoming_token for account {}",
+                            self.account.id
+                        )
+                    })
+                    .ok();
+        }
+        if let Some(ref encrypted) = self.account.ilp_over_http_incoming_token {
+            self.account.ilp_over_http_incoming_token =
+                decrypt_token(decryption_key, &encrypted.expose_secret())
+                    .map_err(|_| {
+                        error!(
+                            "Unable to decrypt ilp_over_http_incoming_token for account {}",
+                            self.account.id
+                        )
+                    })
+                    .ok();
         }
 
         self.account
     }
 }
 
+// Uuid does not implement ToRedisArgs and FromRedisValue.
+// Rust does not allow implementing foreign traits on foreign data types.
+// As a result, we wrap Uuid in a local data type, and implement the necessary
+// traits for that.
+#[derive(Eq, PartialEq, Hash, Debug, Default, Serialize, Deserialize, Copy, Clone)]
+pub struct AccountId(Uuid);
+
+impl AccountId {
+    pub fn new() -> Self {
+        let uid = Uuid::new_v4();
+        AccountId(uid)
+    }
+}
+
+impl FromStr for AccountId {
+    type Err = ParseError;
+
+    fn from_str(src: &str) -> Result<Self, Self::Err> {
+        let uid = Uuid::from_str(&src)?;
+        Ok(AccountId(uid))
+    }
+}
+
+impl Display for AccountId {
+    fn fmt(&self, f: &mut ::std::fmt::Formatter) -> Result<(), ::std::fmt::Error> {
+        f.write_str(&self.0.to_hyphenated().to_string())
+    }
+}
+
+impl ToRedisArgs for AccountId {
+    fn write_redis_args<W: RedisWrite + ?Sized>(&self, out: &mut W) {
+        out.write_arg(self.0.to_hyphenated().to_string().as_bytes().as_ref());
+    }
+}
+
+impl FromRedisValue for AccountId {
+    fn from_redis_value(v: &Value) -> Result<Self, RedisError> {
+        let account_id = String::from_redis_value(v)?;
+        let uid = Uuid::from_str(&account_id)
+            .map_err(|_| RedisError::from((ErrorKind::TypeError, "Invalid account id string")))?;
+        Ok(AccountId(uid))
+    }
+}
+
 impl ToRedisArgs for AccountWithEncryptedTokens {
-    fn write_redis_args(&self, out: &mut Vec<Vec<u8>>) {
+    fn write_redis_args<W: RedisWrite + ?Sized>(&self, out: &mut W) {
         let mut rv = Vec::with_capacity(ACCOUNT_DETAILS_FIELDS * 2);
         let account = &self.account;
 
         "id".write_redis_args(&mut rv);
         account.id.write_redis_args(&mut rv);
+        "username".write_redis_args(&mut rv);
+        account
+            .username
+            .as_bytes()
+            .to_vec()
+            .write_redis_args(&mut rv);
         if !account.ilp_address.is_empty() {
             "ilp_address".write_redis_args(&mut rv);
             rv.push(account.ilp_address.to_bytes().to_vec());
@@ -208,21 +318,41 @@ impl ToRedisArgs for AccountWithEncryptedTokens {
         account.round_trip_time.write_redis_args(&mut rv);
 
         // Write optional fields
-        if let Some(http_endpoint) = account.http_endpoint.as_ref() {
-            "http_endpoint".write_redis_args(&mut rv);
-            http_endpoint.as_str().write_redis_args(&mut rv);
+        if let Some(ilp_over_http_url) = account.ilp_over_http_url.as_ref() {
+            "ilp_over_http_url".write_redis_args(&mut rv);
+            ilp_over_http_url.as_str().write_redis_args(&mut rv);
         }
-        if let Some(http_outgoing_token) = account.http_outgoing_token.as_ref() {
-            "http_outgoing_token".write_redis_args(&mut rv);
-            http_outgoing_token.as_ref().write_redis_args(&mut rv);
+        if let Some(ilp_over_http_incoming_token) = account.ilp_over_http_incoming_token.as_ref() {
+            "ilp_over_http_incoming_token".write_redis_args(&mut rv);
+            ilp_over_http_incoming_token
+                .expose_secret()
+                .as_ref()
+                .write_redis_args(&mut rv);
         }
-        if let Some(btp_uri) = account.btp_uri.as_ref() {
-            "btp_uri".write_redis_args(&mut rv);
-            btp_uri.as_str().write_redis_args(&mut rv);
+        if let Some(ilp_over_http_outgoing_token) = account.ilp_over_http_outgoing_token.as_ref() {
+            "ilp_over_http_outgoing_token".write_redis_args(&mut rv);
+            ilp_over_http_outgoing_token
+                .expose_secret()
+                .as_ref()
+                .write_redis_args(&mut rv);
         }
-        if let Some(btp_outgoing_token) = account.btp_outgoing_token.as_ref() {
-            "btp_outgoing_token".write_redis_args(&mut rv);
-            btp_outgoing_token.as_ref().write_redis_args(&mut rv);
+        if let Some(ilp_over_btp_url) = account.ilp_over_btp_url.as_ref() {
+            "ilp_over_btp_url".write_redis_args(&mut rv);
+            ilp_over_btp_url.as_str().write_redis_args(&mut rv);
+        }
+        if let Some(ilp_over_btp_incoming_token) = account.ilp_over_btp_incoming_token.as_ref() {
+            "ilp_over_btp_incoming_token".write_redis_args(&mut rv);
+            ilp_over_btp_incoming_token
+                .expose_secret()
+                .as_ref()
+                .write_redis_args(&mut rv);
+        }
+        if let Some(ilp_over_btp_outgoing_token) = account.ilp_over_btp_outgoing_token.as_ref() {
+            "ilp_over_btp_outgoing_token".write_redis_args(&mut rv);
+            ilp_over_btp_outgoing_token
+                .expose_secret()
+                .as_ref()
+                .write_redis_args(&mut rv);
         }
         if let Some(settle_threshold) = account.settle_threshold {
             "settle_threshold".write_redis_args(&mut rv);
@@ -231,14 +361,6 @@ impl ToRedisArgs for AccountWithEncryptedTokens {
         if let Some(settle_to) = account.settle_to {
             "settle_to".write_redis_args(&mut rv);
             settle_to.write_redis_args(&mut rv);
-        }
-        if account.send_routes {
-            "send_routes".write_redis_args(&mut rv);
-            account.send_routes.write_redis_args(&mut rv);
-        }
-        if account.receive_routes {
-            "receive_routes".write_redis_args(&mut rv);
-            account.receive_routes.write_redis_args(&mut rv);
         }
         if let Some(limit) = account.packets_per_minute_limit {
             "packets_per_minute_limit".write_redis_args(&mut rv);
@@ -270,33 +392,53 @@ impl FromRedisValue for AccountWithEncryptedTokens {
         let ilp_address: String = get_value("ilp_address", &hash)?;
         let ilp_address = Address::from_str(&ilp_address)
             .map_err(|_| RedisError::from((ErrorKind::TypeError, "Invalid ILP address")))?;
+        let username: String = get_value("username", &hash)?;
+        let username = Username::from_str(&username)
+            .map_err(|_| RedisError::from((ErrorKind::TypeError, "Invalid username")))?;
         let routing_relation: Option<String> = get_value_option("routing_relation", &hash)?;
         let routing_relation = if let Some(relation) = routing_relation {
             RoutingRelation::from_str(relation.as_str())
                 .map_err(|_| RedisError::from((ErrorKind::TypeError, "Invalid Routing Relation")))?
         } else {
-            RoutingRelation::Child
+            RoutingRelation::NonRoutingAccount
         };
-        let round_trip_time: Option<u64> = get_value_option("round_trip_time", &hash)?;
-        let round_trip_time: u64 = round_trip_time.unwrap_or(DEFAULT_ROUND_TRIP_TIME);
+        let round_trip_time: Option<u32> = get_value_option("round_trip_time", &hash)?;
+        let round_trip_time: u32 = round_trip_time.unwrap_or(DEFAULT_ROUND_TRIP_TIME);
 
         Ok(AccountWithEncryptedTokens {
             account: Account {
                 id: get_value("id", &hash)?,
+                username,
                 ilp_address,
                 asset_code: get_value("asset_code", &hash)?,
                 asset_scale: get_value("asset_scale", &hash)?,
-                http_endpoint: get_url_option("http_endpoint", &hash)?,
-                http_outgoing_token: get_bytes_option("http_outgoing_token", &hash)?,
-                btp_uri: get_url_option("btp_uri", &hash)?,
-                btp_outgoing_token: get_bytes_option("btp_outgoing_token", &hash)?,
+                ilp_over_http_url: get_url_option("ilp_over_http_url", &hash)?,
+                ilp_over_http_incoming_token: get_bytes_option(
+                    "ilp_over_http_incoming_token",
+                    &hash,
+                )?
+                .map(SecretBytes::from),
+                ilp_over_http_outgoing_token: get_bytes_option(
+                    "ilp_over_http_outgoing_token",
+                    &hash,
+                )?
+                .map(SecretBytes::from),
+                ilp_over_btp_url: get_url_option("ilp_over_btp_url", &hash)?,
+                ilp_over_btp_incoming_token: get_bytes_option(
+                    "ilp_over_btp_incoming_token",
+                    &hash,
+                )?
+                .map(SecretBytes::from),
+                ilp_over_btp_outgoing_token: get_bytes_option(
+                    "ilp_over_btp_outgoing_token",
+                    &hash,
+                )?
+                .map(SecretBytes::from),
                 max_packet_amount: get_value("max_packet_amount", &hash)?,
                 min_balance: get_value_option("min_balance", &hash)?,
                 settle_threshold: get_value_option("settle_threshold", &hash)?,
                 settle_to: get_value_option("settle_to", &hash)?,
                 routing_relation,
-                send_routes: get_bool("send_routes", &hash),
-                receive_routes: get_bool("receive_routes", &hash),
                 round_trip_time,
                 packets_per_minute_limit: get_value_option("packets_per_minute_limit", &hash)?,
                 amount_per_minute_limit: get_value_option("amount_per_minute_limit", &hash)?,
@@ -354,27 +496,18 @@ fn get_url_option(key: &str, map: &HashMap<String, Value>) -> Result<Option<Url>
     }
 }
 
-fn get_bool(key: &str, map: &HashMap<String, Value>) -> bool {
-    if let Some(ref value) = map.get(key) {
-        if let Ok(value) = from_redis_value(value) as Result<String, RedisError> {
-            if value.to_lowercase() == "true" {
-                return true;
-            }
-        }
-    }
-    false
-}
-
 impl AccountTrait for Account {
-    type AccountId = u64;
+    type AccountId = AccountId;
 
     fn id(&self) -> Self::AccountId {
         self.id
     }
-}
 
-impl IldcpAccount for Account {
-    fn client_address(&self) -> &Address {
+    fn username(&self) -> &Username {
+        &self.username
+    }
+
+    fn ilp_address(&self) -> &Address {
         &self.ilp_address
     }
 
@@ -389,24 +522,24 @@ impl IldcpAccount for Account {
 
 impl HttpAccount for Account {
     fn get_http_url(&self) -> Option<&Url> {
-        self.http_endpoint.as_ref()
+        self.ilp_over_http_url.as_ref()
     }
 
     fn get_http_auth_token(&self) -> Option<&str> {
-        self.http_outgoing_token
+        self.ilp_over_http_outgoing_token
             .as_ref()
-            .map(|s| str::from_utf8(s.as_ref()).unwrap_or_default())
+            .map(|s| str::from_utf8(s.expose_secret().as_ref()).unwrap_or_default())
     }
 }
 
 impl BtpAccount for Account {
-    fn get_btp_uri(&self) -> Option<&Url> {
-        self.btp_uri.as_ref()
+    fn get_ilp_over_btp_url(&self) -> Option<&Url> {
+        self.ilp_over_btp_url.as_ref()
     }
 
-    fn get_btp_token(&self) -> Option<&[u8]> {
-        if let Some(ref token) = self.btp_outgoing_token {
-            Some(token)
+    fn get_ilp_over_btp_outgoing_token(&self) -> Option<&[u8]> {
+        if let Some(ref token) = self.ilp_over_btp_outgoing_token {
+            Some(&token.expose_secret())
         } else {
             None
         }
@@ -423,18 +556,10 @@ impl CcpRoutingAccount for Account {
     fn routing_relation(&self) -> RoutingRelation {
         self.routing_relation
     }
-
-    fn should_send_routes(&self) -> bool {
-        self.send_routes
-    }
-
-    fn should_receive_routes(&self) -> bool {
-        self.receive_routes
-    }
 }
 
 impl RoundTripTimeAccount for Account {
-    fn round_trip_time(&self) -> u64 {
+    fn round_trip_time(&self) -> u32 {
         self.round_trip_time
     }
 }
@@ -462,23 +587,25 @@ impl SettlementAccount for Account {
 mod redis_account {
     use super::*;
     use lazy_static::lazy_static;
+    use secrecy::SecretString;
 
     lazy_static! {
         static ref ACCOUNT_DETAILS: AccountDetails = AccountDetails {
-            ilp_address: Address::from_str("example.alice").unwrap(),
+            ilp_address: Some(Address::from_str("example.alice").unwrap()),
+            username: Username::from_str("alice").unwrap(),
             asset_scale: 6,
             asset_code: "XYZ".to_string(),
             max_packet_amount: 1000,
             min_balance: Some(-1000),
-            http_endpoint: Some("http://example.com/ilp".to_string()),
-            http_incoming_token: Some("incoming_auth_token".to_string()),
-            http_outgoing_token: Some("outgoing_auth_token".to_string()),
-            btp_uri: Some("btp+ws://:btp_token@example.com/btp".to_string()),
-            btp_incoming_token: Some("btp_token".to_string()),
+            ilp_over_http_url: Some("http://example.com/ilp".to_string()),
+            // we are Bob and we're using this account to peer with Alice
+            ilp_over_http_incoming_token: Some(SecretString::new("incoming_auth_token".to_string())),
+            ilp_over_http_outgoing_token: Some(SecretString::new("bob:outgoing_auth_token".to_string())),
+            ilp_over_btp_url: Some("btp+ws://example.com/ilp/btp".to_string()),
+            ilp_over_btp_incoming_token: Some(SecretString::new("alice:btp_token".to_string())),
+            ilp_over_btp_outgoing_token: Some(SecretString::new("bob:btp_token".to_string())),
             settle_threshold: Some(0),
             settle_to: Some(-1000),
-            send_routes: true,
-            receive_routes: true,
             routing_relation: Some("Peer".to_string()),
             round_trip_time: Some(600),
             amount_per_minute_limit: None,
@@ -489,13 +616,26 @@ mod redis_account {
 
     #[test]
     fn from_account_details() {
-        let account = Account::try_from(10, ACCOUNT_DETAILS.clone()).unwrap();
-        assert_eq!(account.id(), 10);
+        let id = AccountId::new();
+        let account = Account::try_from(
+            id,
+            ACCOUNT_DETAILS.clone(),
+            Address::from_str("example.account").unwrap(),
+        )
+        .unwrap();
+        assert_eq!(account.id(), id);
         assert_eq!(
             account.get_http_auth_token().unwrap(),
-            "outgoing_auth_token"
+            format!("{}:outgoing_auth_token", "bob"),
         );
-        assert_eq!(account.get_btp_token().unwrap(), b"btp_token");
+        assert_eq!(
+            account.get_ilp_over_btp_outgoing_token().unwrap(),
+            format!("{}:btp_token", "bob").as_bytes(),
+        );
+        assert_eq!(
+            account.get_ilp_over_btp_url().unwrap().to_string(),
+            "btp+ws://example.com/ilp/btp",
+        );
         assert_eq!(account.routing_relation(), RoutingRelation::Peer);
     }
 }

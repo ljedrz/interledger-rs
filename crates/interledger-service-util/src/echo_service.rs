@@ -6,6 +6,7 @@ use interledger_packet::{
     oer::BufOerExt, Address, ErrorCode, Prepare, PrepareBuilder, RejectBuilder,
 };
 use interledger_service::*;
+use log::debug;
 use std::convert::TryFrom;
 use std::marker::PhantomData;
 use std::str;
@@ -27,40 +28,43 @@ enum EchoPacketType {
 }
 
 #[derive(Clone)]
-pub struct EchoService<I, A> {
-    /// The ILP address which this ECHO service should respond for
-    ilp_address: Address,
+pub struct EchoService<I, S, A> {
+    store: S,
     next: I,
     account_type: PhantomData<A>,
 }
 
-impl<I, A> EchoService<I, A>
+impl<I, S, A> EchoService<I, S, A>
 where
+    S: AddressStore,
     I: IncomingService<A>,
     A: Account,
 {
-    pub fn new(ilp_address: Address, next: I) -> Self {
+    pub fn new(store: S, next: I) -> Self {
         EchoService {
-            ilp_address,
+            store,
             next,
             account_type: PhantomData,
         }
     }
 }
 
-impl<I, A> IncomingService<A> for EchoService<I, A>
+impl<I, S, A> IncomingService<A> for EchoService<I, S, A>
 where
     I: IncomingService<A>,
+    S: AddressStore,
     A: Account,
 {
     type Future = BoxedIlpFuture;
 
     fn handle_request(&mut self, mut request: IncomingRequest<A>) -> Self::Future {
-        let should_echo = request.prepare.destination() == self.ilp_address
+        let ilp_address = self.store.get_ilp_address();
+        let should_echo = request.prepare.destination() == ilp_address
             && request.prepare.data().starts_with(ECHO_PREFIX.as_bytes());
         if !should_echo {
             return Box::new(self.next.handle_request(request));
         }
+        debug!("Responding to Echo protocol request: {:?}", request);
 
         // TODO Define EchoPacket struct and implement From<&p[u8]> for it
 
@@ -77,7 +81,7 @@ where
                 return Box::new(err(RejectBuilder {
                     code: ErrorCode::F01_INVALID_PACKET,
                     message: b"Could not read echo packet type.",
-                    triggered_by: Some(&self.ilp_address),
+                    triggered_by: Some(&ilp_address),
                     data: &[],
                 }
                 .build()));
@@ -97,7 +101,7 @@ where
                     echo_packet_type
                 )
                 .as_bytes(),
-                triggered_by: Some(&self.ilp_address),
+                triggered_by: Some(&ilp_address),
                 data: &[],
             }
             .build()));
@@ -115,7 +119,7 @@ where
                     return Box::new(err(RejectBuilder {
                         code: ErrorCode::F01_INVALID_PACKET,
                         message: b"Could not parse source address from Echo packet",
-                        triggered_by: Some(&self.ilp_address),
+                        triggered_by: Some(&ilp_address),
                         data: &[],
                     }
                     .build()));
@@ -126,7 +130,7 @@ where
                 return Box::new(err(RejectBuilder {
                     code: ErrorCode::F01_INVALID_PACKET,
                     message: b"Could not read source address.",
-                    triggered_by: Some(&self.ilp_address),
+                    triggered_by: Some(&ilp_address),
                     data: &[],
                 }
                 .build()));
@@ -213,11 +217,39 @@ mod echo_tests {
     use futures::future::Future;
     use interledger_packet::{FulfillBuilder, PrepareBuilder};
     use interledger_service::incoming_service_fn;
+    use lazy_static::lazy_static;
     use ring::digest::{digest, SHA256};
     use ring::rand::{SecureRandom, SystemRandom};
-
     use std::str::FromStr;
     use std::time::{Duration, SystemTime};
+
+    lazy_static! {
+        pub static ref ALICE: Username = Username::from_str("alice").unwrap();
+        pub static ref EXAMPLE_ADDRESS: Address = Address::from_str("example.alice").unwrap();
+    }
+
+    #[derive(Clone)]
+    struct TestStore(Address);
+
+    impl AddressStore for TestStore {
+        /// Saves the ILP Address in the store's memory and database
+        fn set_ilp_address(
+            &self,
+            _ilp_address: Address,
+        ) -> Box<dyn Future<Item = (), Error = ()> + Send> {
+            unimplemented!()
+        }
+
+        fn clear_ilp_address(&self) -> Box<dyn Future<Item = (), Error = ()> + Send> {
+            unimplemented!()
+        }
+
+        /// Get's the store's ilp address from memory
+        fn get_ilp_address(&self) -> Address {
+            self.0.clone()
+        }
+    }
+
     #[derive(Debug, Clone)]
     struct TestAccount(u64);
 
@@ -225,6 +257,23 @@ mod echo_tests {
         type AccountId = u64;
         fn id(&self) -> u64 {
             self.0
+        }
+
+        fn username(&self) -> &Username {
+            &ALICE
+        }
+
+        fn asset_code(&self) -> &str {
+            "XYZ"
+        }
+
+        // All connector accounts use asset scale = 9.
+        fn asset_scale(&self) -> u8 {
+            9
+        }
+
+        fn ilp_address(&self) -> &Address {
+            &EXAMPLE_ADDRESS
         }
     }
 
@@ -254,7 +303,7 @@ mod echo_tests {
             }
             .build())
         });
-        let mut echo_service = EchoService::new(node_address, handler);
+        let mut echo_service = EchoService::new(TestStore(node_address), handler);
 
         // setup request
         let prepare = EchoRequestBuilder {
@@ -300,7 +349,7 @@ mod echo_tests {
             }
             .build())
         });
-        let mut echo_service = EchoService::new(node_address, handler);
+        let mut echo_service = EchoService::new(TestStore(node_address), handler);
 
         // setup request
         let prepare = PrepareBuilder {
@@ -346,7 +395,7 @@ mod echo_tests {
             }
             .build())
         });
-        let mut echo_service = EchoService::new(node_address, handler);
+        let mut echo_service = EchoService::new(TestStore(node_address), handler);
 
         // setup request
         let prepare = EchoRequestBuilder {
@@ -387,7 +436,7 @@ mod echo_tests {
             }
             .build())
         });
-        let mut echo_service = EchoService::new(node_address, handler);
+        let mut echo_service = EchoService::new(TestStore(node_address), handler);
 
         // setup request
         let prepare = PrepareBuilder {
@@ -429,7 +478,7 @@ mod echo_tests {
             }
             .build())
         });
-        let mut echo_service = EchoService::new(node_address, handler);
+        let mut echo_service = EchoService::new(TestStore(node_address), handler);
 
         // setup request
         let prepare = PrepareBuilder {

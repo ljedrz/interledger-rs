@@ -4,8 +4,9 @@
 
 mod account;
 mod crypto;
+mod reconnect;
 mod store;
 
-pub use account::Account;
+pub use account::{Account, AccountId};
 pub use redis::{ConnectionInfo, IntoConnectionInfo};
 pub use store::{RedisStore, RedisStoreBuilder};

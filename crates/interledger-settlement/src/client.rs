@@ -3,7 +3,6 @@ use futures::{
     future::{err, Either},
     Future,
 };
-use interledger_ildcp::IldcpAccount;
 use log::{debug, error, trace};
 use reqwest::r#async::Client;
 use serde_json::json;
@@ -21,7 +20,7 @@ impl SettlementClient {
         }
     }
 
-    pub fn send_settlement<A: SettlementAccount + IldcpAccount>(
+    pub fn send_settlement<A: SettlementAccount>(
         &self,
         account: A,
         amount: u64,
@@ -40,7 +39,7 @@ impl SettlementClient {
             );
             let settlement_engine_url_clone = settlement_engine_url.clone();
             let idempotency_uuid = Uuid::new_v4().to_hyphenated().to_string();
-            return Either::A(self.http_client.post(settlement_engine_url.clone())
+            return Either::A(self.http_client.post(settlement_engine_url.as_ref())
                 .header("Idempotency-Key", idempotency_uuid)
                 .json(&json!(Quantity::new(amount, account.asset_scale())))
                 .send()

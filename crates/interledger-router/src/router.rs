@@ -1,5 +1,4 @@
 use super::RouterStore;
-use bytes::Bytes;
 use futures::{future::err, Future};
 use interledger_packet::{ErrorCode, RejectBuilder};
 use interledger_service::*;
@@ -41,24 +40,25 @@ where
 
 impl<S, O> IncomingService<S::Account> for Router<S, O>
 where
-    S: RouterStore,
+    S: AddressStore + RouterStore,
     O: OutgoingService<S::Account> + Clone + Send + 'static,
 {
     type Future = BoxedIlpFuture;
 
     /// Figures out the next node to pass the received Prepare packet to.
     ///
-    /// Firstly, it checks if there is a direct path for that account and use that.
+    /// Firstly, it checks if there is a direct path for that account and uses that.
     /// If not it scans through the routing table and checks if the route prefix matches
     /// the prepare packet's destination or if it's a catch-all address (i.e. empty prefix)
     fn handle_request(&mut self, request: IncomingRequest<S::Account>) -> Self::Future {
         let destination = request.prepare.destination();
         let mut next_hop = None;
         let routing_table = self.store.routing_table();
+        let ilp_address = self.store.get_ilp_address();
 
         // Check if we have a direct path for that account or if we need to scan
         // through the routing table
-        let dest: &[u8] = destination.as_ref();
+        let dest: &str = &destination;
         if let Some(account_id) = routing_table.get(dest) {
             trace!(
                 "Found direct route for address: \"{}\". Account: {}",
@@ -67,26 +67,22 @@ where
             );
             next_hop = Some(*account_id);
         } else if !routing_table.is_empty() {
-            let mut matching_prefix = Bytes::new();
-            for route in self.store.routing_table() {
-                trace!(
-                    "Checking route: \"{}\" -> {}",
-                    str::from_utf8(&route.0[..]).unwrap_or("<not utf8>"),
-                    route.1
-                );
+            let mut matching_prefix = "";
+            let routing_table = self.store.routing_table();
+            for (ref prefix, account) in (*routing_table).iter() {
                 // Check if the route prefix matches or is empty (meaning it's a catch-all address)
-                if (route.0.is_empty() || dest.starts_with(&route.0[..]))
-                    && route.0.len() >= matching_prefix.len()
+                if (prefix.is_empty() || dest.starts_with(prefix.as_str()))
+                    && prefix.len() >= matching_prefix.len()
                 {
-                    next_hop.replace(route.1);
-                    matching_prefix = route.0;
+                    next_hop.replace(account.clone());
+                    matching_prefix = prefix.as_str();
                 }
             }
             if let Some(account_id) = next_hop {
                 trace!(
                     "Found matching route for address: \"{}\". Prefix: \"{}\", account: {}",
                     destination,
-                    str::from_utf8(&matching_prefix[..]).unwrap_or("<not utf8>"),
+                    matching_prefix,
                     account_id,
                 );
             }
@@ -104,7 +100,7 @@ where
                         RejectBuilder {
                             code: ErrorCode::F02_UNREACHABLE,
                             message: &[],
-                            triggered_by: None,
+                            triggered_by: Some(&ilp_address),
                             data: &[],
                         }
                         .build()
@@ -115,11 +111,28 @@ where
                     }),
             )
         } else {
-            error!("No route found for request: {:?}", request);
+            error!(
+                "No route found for request {}: {:?}",
+                {
+                    // Log a warning if the global prefix does not match
+                    let destination = request.prepare.destination();
+                    if destination.scheme() != ilp_address.scheme()
+                        && destination.scheme() != "peer"
+                    {
+                        format!(
+                        " (warning: address does not start with the right scheme prefix, expected: \"{}\")",
+                        ilp_address.scheme()
+                    )
+                    } else {
+                        "".to_string()
+                    }
+                },
+                request
+            );
             Box::new(err(RejectBuilder {
                 code: ErrorCode::F02_UNREACHABLE,
                 message: &[],
-                triggered_by: None,
+                triggered_by: Some(&ilp_address),
                 data: &[],
             }
             .build()))
@@ -133,6 +146,7 @@ mod tests {
     use futures::future::ok;
     use interledger_packet::{Address, FulfillBuilder, PrepareBuilder};
     use interledger_service::outgoing_service_fn;
+    use lazy_static::lazy_static;
     use parking_lot::Mutex;
     use std::collections::HashMap;
     use std::iter::FromIterator;
@@ -143,16 +157,37 @@ mod tests {
     #[derive(Debug, Clone)]
     struct TestAccount(u64);
 
+    lazy_static! {
+        pub static ref ALICE: Username = Username::from_str("alice").unwrap();
+        pub static ref EXAMPLE_ADDRESS: Address = Address::from_str("example.alice").unwrap();
+    }
+
     impl Account for TestAccount {
         type AccountId = u64;
         fn id(&self) -> u64 {
             self.0
         }
+
+        fn username(&self) -> &Username {
+            &ALICE
+        }
+
+        fn asset_scale(&self) -> u8 {
+            9
+        }
+
+        fn asset_code(&self) -> &str {
+            "XYZ"
+        }
+
+        fn ilp_address(&self) -> &Address {
+            &EXAMPLE_ADDRESS
+        }
     }
 
     #[derive(Clone)]
     struct TestStore {
-        routes: HashMap<Bytes, u64>,
+        routes: HashMap<String, u64>,
     }
 
     impl AccountStore for TestStore {
@@ -164,11 +199,38 @@ mod tests {
         ) -> Box<dyn Future<Item = Vec<TestAccount>, Error = ()> + Send> {
             Box::new(ok(account_ids.into_iter().map(TestAccount).collect()))
         }
+
+        // stub implementation (not used in these tests)
+        fn get_account_id_from_username(
+            &self,
+            _username: &Username,
+        ) -> Box<dyn Future<Item = u64, Error = ()> + Send> {
+            Box::new(ok(1))
+        }
+    }
+
+    impl AddressStore for TestStore {
+        /// Saves the ILP Address in the store's memory and database
+        fn set_ilp_address(
+            &self,
+            _ilp_address: Address,
+        ) -> Box<dyn Future<Item = (), Error = ()> + Send> {
+            unimplemented!()
+        }
+
+        fn clear_ilp_address(&self) -> Box<dyn Future<Item = (), Error = ()> + Send> {
+            unimplemented!()
+        }
+
+        /// Get's the store's ilp address from memory
+        fn get_ilp_address(&self) -> Address {
+            Address::from_str("example.connector").unwrap()
+        }
     }
 
     impl RouterStore for TestStore {
-        fn routing_table(&self) -> HashMap<Bytes, u64> {
-            self.routes.clone()
+        fn routing_table(&self) -> Arc<HashMap<String, u64>> {
+            Arc::new(self.routes.clone())
         }
     }
 
@@ -207,7 +269,7 @@ mod tests {
     fn no_route() {
         let mut router = Router::new(
             TestStore {
-                routes: HashMap::from_iter(vec![(Bytes::from("example.other"), 1)].into_iter()),
+                routes: HashMap::from_iter(vec![("example.other".to_string(), 1)].into_iter()),
             },
             outgoing_service_fn(|_| {
                 Ok(FulfillBuilder {
@@ -239,7 +301,7 @@ mod tests {
         let mut router = Router::new(
             TestStore {
                 routes: HashMap::from_iter(
-                    vec![(Bytes::from("example.destination"), 1)].into_iter(),
+                    vec![("example.destination".to_string(), 1)].into_iter(),
                 ),
             },
             outgoing_service_fn(|_| {
@@ -271,7 +333,7 @@ mod tests {
     fn catch_all_route() {
         let mut router = Router::new(
             TestStore {
-                routes: HashMap::from_iter(vec![(Bytes::from(""), 0)].into_iter()),
+                routes: HashMap::from_iter(vec![(String::new(), 0)].into_iter()),
             },
             outgoing_service_fn(|_| {
                 Ok(FulfillBuilder {
@@ -302,7 +364,7 @@ mod tests {
     fn finds_matching_prefix() {
         let mut router = Router::new(
             TestStore {
-                routes: HashMap::from_iter(vec![(Bytes::from("example."), 1)].into_iter()),
+                routes: HashMap::from_iter(vec![("example.".to_string(), 1)].into_iter()),
             },
             outgoing_service_fn(|_| {
                 Ok(FulfillBuilder {
@@ -337,9 +399,9 @@ mod tests {
             TestStore {
                 routes: HashMap::from_iter(
                     vec![
-                        (Bytes::from(""), 0),
-                        (Bytes::from("example.destination"), 2),
-                        (Bytes::from("example."), 1),
+                        (String::new(), 0),
+                        ("example.destination".to_string(), 2),
+                        ("example.".to_string(), 1),
                     ]
                     .into_iter(),
                 ),

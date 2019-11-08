@@ -3,7 +3,7 @@ use futures::{
     future::{err, Either},
     Future, Stream,
 };
-use interledger_packet::{Address, ErrorCode, FulfillBuilder, RejectBuilder};
+use interledger_packet::{ErrorCode, FulfillBuilder, RejectBuilder};
 use interledger_service::{BoxedIlpFuture, IncomingRequest, IncomingService};
 use log::error;
 use reqwest::r#async::Client;
@@ -14,7 +14,6 @@ const PEER_FULFILLMENT: [u8; 32] = [0; 32];
 
 #[derive(Clone)]
 pub struct SettlementMessageService<I, A> {
-    ilp_address: Address,
     next: I,
     http_client: Client,
     account_type: PhantomData<A>,
@@ -25,10 +24,9 @@ where
     I: IncomingService<A>,
     A: SettlementAccount,
 {
-    pub fn new(ilp_address: Address, next: I) -> Self {
+    pub fn new(next: I) -> Self {
         SettlementMessageService {
             next,
-            ilp_address,
             http_client: Client::new(),
             account_type: PhantomData,
         }
@@ -64,7 +62,7 @@ where
                 let http_client = self.http_client.clone();
                 let action = move || {
                     http_client
-                        .post(settlement_engine_url.clone())
+                        .post(settlement_engine_url.as_ref())
                         .header("Content-Type", "application/octet-stream")
                         .header("Idempotency-Key", idempotency_uuid.clone())
                         .body(message.clone())
@@ -125,7 +123,7 @@ mod tests {
     use super::*;
     use crate::fixtures::{BODY, DATA, SERVICE_ADDRESS, TEST_ACCOUNT_0};
     use crate::test_helpers::{block_on, mock_message, test_service};
-    use interledger_packet::{Fulfill, PrepareBuilder, Reject};
+    use interledger_packet::{Address, Fulfill, PrepareBuilder, Reject};
     use std::str::FromStr;
     use std::time::SystemTime;
 
@@ -243,5 +241,4 @@ mod tests {
             .as_bytes(),
         );
     }
-
 }

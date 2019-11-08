@@ -3,15 +3,20 @@ mod common;
 use common::*;
 use interledger_btp::{BtpAccount, BtpStore};
 use interledger_http::HttpAccount;
-use interledger_service::Account as AccountTrait;
+use interledger_packet::Address;
+use interledger_service::{Account, Username};
+use std::str::FromStr;
 
 #[test]
-fn gets_account_from_btp_token() {
-    block_on(test_store().and_then(|(store, context)| {
+fn gets_account_from_btp_auth() {
+    block_on(test_store().and_then(|(store, context, _accs)| {
         store
-            .get_account_from_btp_token("other_btp_token")
+            .get_account_from_btp_auth(&Username::from_str("bob").unwrap(), "other_btp_token")
             .and_then(move |account| {
-                assert_eq!(account.id(), 1);
+                assert_eq!(
+                    *account.ilp_address(),
+                    Address::from_str("example.alice.user1.bob").unwrap()
+                );
                 let _ = context;
                 Ok(())
             })
@@ -20,18 +25,19 @@ fn gets_account_from_btp_token() {
 }
 
 #[test]
-fn decrypts_outgoing_tokens() {
-    block_on(test_store().and_then(|(store, context)| {
+fn decrypts_outgoing_tokens_btp() {
+    block_on(test_store().and_then(|(store, context, _accs)| {
         store
-            .get_account_from_btp_token("other_btp_token")
+            .get_account_from_btp_auth(&Username::from_str("bob").unwrap(), "other_btp_token")
             .and_then(move |account| {
+                // the account is created on Dylan's connector
                 assert_eq!(
                     account.get_http_auth_token().unwrap(),
-                    "outgoing_auth_token"
+                    &format!("{}:outgoing_auth_token", "dylan"),
                 );
                 assert_eq!(
-                    account.get_btp_token().unwrap(),
-                    b"other_outgoing_btp_token"
+                    &account.get_ilp_over_btp_outgoing_token().unwrap(),
+                    &format!("{}:btp_token", "dylan").as_bytes(),
                 );
                 let _ = context;
                 Ok(())
@@ -42,9 +48,12 @@ fn decrypts_outgoing_tokens() {
 
 #[test]
 fn errors_on_unknown_btp_token() {
-    let result = block_on(test_store().and_then(|(store, context)| {
+    let result = block_on(test_store().and_then(|(store, context, _accs)| {
         store
-            .get_account_from_btp_token("unknown_btp_token")
+            .get_account_from_btp_auth(
+                &Username::from_str("someuser").unwrap(),
+                "unknown_btp_token",
+            )
             .then(move |result| {
                 let _ = context;
                 result

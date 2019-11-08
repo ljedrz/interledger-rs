@@ -1,13 +1,17 @@
 use super::{HttpAccount, HttpStore};
 use bytes::BytesMut;
-use futures::{future::result, Future, Stream};
-use interledger_packet::{ErrorCode, Fulfill, Packet, Reject, RejectBuilder};
+use futures::{
+    future::{err, result},
+    Future, Stream,
+};
+use interledger_packet::{Address, ErrorCode, Fulfill, Packet, Reject, RejectBuilder};
 use interledger_service::*;
 use log::{error, trace};
 use reqwest::{
     header::{HeaderMap, HeaderName, HeaderValue},
     r#async::{Chunk, Client, ClientBuilder, Response as HttpResponse},
 };
+use std::str::FromStr;
 use std::{convert::TryFrom, marker::PhantomData, sync::Arc, time::Duration};
 
 #[derive(Clone)]
@@ -20,7 +24,7 @@ pub struct HttpClientService<S, O, A> {
 
 impl<S, O, A> HttpClientService<S, O, A>
 where
-    S: HttpStore,
+    S: AddressStore + HttpStore,
     O: OutgoingService<A> + Clone,
     A: HttpAccount,
 {
@@ -47,7 +51,7 @@ where
 
 impl<S, O, A> OutgoingService<A> for HttpClientService<S, O, A>
 where
-    S: HttpStore,
+    S: AddressStore + HttpStore,
     O: OutgoingService<A>,
     A: HttpAccount,
 {
@@ -55,32 +59,56 @@ where
 
     /// Send an OutgoingRequest to a peer that implements the ILP-Over-HTTP.
     fn send_request(&mut self, request: OutgoingRequest<A>) -> Self::Future {
+        let ilp_address = self.store.get_ilp_address();
+        let ilp_address_clone = ilp_address.clone();
         if let Some(url) = request.to.get_http_url() {
             trace!(
                 "Sending outgoing ILP over HTTP packet to account: {} (URL: {})",
                 request.to.id(),
                 url.as_str()
             );
+            let token = request.to.get_http_auth_token().unwrap_or("");
+            let auth = match AuthToken::from_str(token) {
+                Ok(auth) => auth,
+                Err(_) => {
+                    return Box::new(err(RejectBuilder {
+                        code: ErrorCode::T00_INTERNAL_ERROR,
+                        message: &[],
+                        triggered_by: None,
+                        data: &[],
+                    }
+                    .build()))
+                }
+            };
             Box::new(
                 self.client
-                    .post(url.clone())
-                    .header(
-                        "authorization",
-                        format!("Bearer {}", request.to.get_http_auth_token().unwrap_or("")),
-                    )
+                    .post(url.as_ref())
+                    .header("authorization", auth.to_bearer())
                     .body(BytesMut::from(request.prepare).freeze())
                     .send()
-                    .map_err(|err| {
+                    .map_err(move |err| {
                         error!("Error sending HTTP request: {:?}", err);
+                        let code = if err.is_client_error() {
+                            ErrorCode::F00_BAD_REQUEST
+                        } else {
+                            ErrorCode::T01_PEER_UNREACHABLE
+                        };
+                        let message = if let Some(status) = err.status() {
+                            format!("Error sending ILP over HTTP request: {}", status)
+                        } else if let Some(err) = err.get_ref() {
+                            format!("Error sending ILP over HTTP request: {:?}", err)
+                        } else {
+                            "Error sending ILP over HTTP request".to_string()
+                        };
                         RejectBuilder {
-                            code: ErrorCode::T01_PEER_UNREACHABLE,
-                            message: &[],
-                            triggered_by: None,
+                            code,
+                            message: message.as_str().as_bytes(),
+                            triggered_by: Some(&ilp_address),
                             data: &[],
                         }
                         .build()
                     })
-                    .and_then(parse_packet_from_response),
+                    .and_then(move |resp| parse_packet_from_response(resp, ilp_address_clone)),
             )
         } else {
             Box::new(self.next.send_request(request))
@@ -90,7 +118,9 @@ where
 
 fn parse_packet_from_response(
     response: HttpResponse,
+    ilp_address: Address,
 ) -> impl Future<Item = Fulfill, Error = Reject> {
+    let ilp_address_clone = ilp_address.clone();
     result(response.error_for_status().map_err(|err| {
         error!("HTTP error sending ILP over HTTP packet: {:?}", err);
         let code = if let Some(status) = err.status() {
@@ -106,25 +136,26 @@ fn parse_packet_from_response(
         RejectBuilder {
             code,
             message: &[],
-            triggered_by: None,
+            triggered_by: Some(&ilp_address),
             data: &[],
         }
         .build()
     }))
-    .and_then(|response: HttpResponse| {
+    .and_then(move |response: HttpResponse| {
+        let ilp_address_clone = ilp_address.clone();
         let decoder = response.into_body();
-        decoder.concat2().map_err(|err| {
+        decoder.concat2().map_err(move |err| {
             error!("Error getting HTTP response body: {:?}", err);
             RejectBuilder {
                 code: ErrorCode::T01_PEER_UNREACHABLE,
                 message: &[],
-                triggered_by: None,
+                triggered_by: Some(&ilp_address_clone.clone()),
                 data: &[],
             }
             .build()
         })
     })
-    .and_then(|body: Chunk| {
+    .and_then(move |body: Chunk| {
         // TODO can we get the body as a BytesMut so we don't need to copy?
         let body = BytesMut::from(body.to_vec());
         match Packet::try_from(body) {
@@ -133,7 +164,7 @@ fn parse_packet_from_response(
             _ => Err(RejectBuilder {
                 code: ErrorCode::T01_PEER_UNREACHABLE,
                 message: &[],
-                triggered_by: None,
+                triggered_by: Some(&ilp_address_clone.clone()),
                 data: &[],
             }
             .build()),

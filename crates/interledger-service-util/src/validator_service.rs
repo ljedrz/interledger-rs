@@ -1,3 +1,4 @@
+use chrono::{DateTime, Duration, Utc};
 use futures::{future::err, Future};
 use hex;
 use interledger_packet::{ErrorCode, RejectBuilder};
@@ -5,7 +6,6 @@ use interledger_service::*;
 use log::error;
 use ring::digest::{digest, SHA256};
 use std::marker::PhantomData;
-use std::time::{Duration, SystemTime};
 use tokio::prelude::FutureExt;
 
 /// # Validator Service
@@ -15,40 +15,46 @@ use tokio::prelude::FutureExt;
 /// Forwards everything else.
 ///
 #[derive(Clone)]
-pub struct ValidatorService<IO, A> {
+pub struct ValidatorService<IO, S, A> {
+    store: S,
     next: IO,
     account_type: PhantomData<A>,
 }
 
-impl<I, A> ValidatorService<I, A>
+impl<I, S, A> ValidatorService<I, S, A>
 where
     I: IncomingService<A>,
+    S: AddressStore,
     A: Account,
 {
-    pub fn incoming(next: I) -> Self {
+    pub fn incoming(store: S, next: I) -> Self {
         ValidatorService {
+            store,
             next,
             account_type: PhantomData,
         }
     }
 }
 
-impl<O, A> ValidatorService<O, A>
+impl<O, S, A> ValidatorService<O, S, A>
 where
     O: OutgoingService<A>,
+    S: AddressStore,
     A: Account,
 {
-    pub fn outgoing(next: O) -> Self {
+    pub fn outgoing(store: S, next: O) -> Self {
         ValidatorService {
+            store,
             next,
             account_type: PhantomData,
         }
     }
 }
 
-impl<I, A> IncomingService<A> for ValidatorService<I, A>
+impl<I, S, A> IncomingService<A> for ValidatorService<I, S, A>
 where
     I: IncomingService<A>,
+    S: AddressStore,
     A: Account,
 {
     type Future = BoxedIlpFuture;
@@ -56,22 +62,21 @@ where
     /// On receiving a request:
     /// 1. If the prepare packet in the request is not expired, forward it, otherwise return a reject
     fn handle_request(&mut self, request: IncomingRequest<A>) -> Self::Future {
-        if request.prepare.expires_at() >= SystemTime::now() {
+        let expires_at = DateTime::<Utc>::from(request.prepare.expires_at());
+        let now = Utc::now();
+        if expires_at >= now {
             Box::new(self.next.handle_request(request))
         } else {
             error!(
                 "Incoming packet expired {}ms ago at {:?} (time now: {:?})",
-                SystemTime::now()
-                    .duration_since(request.prepare.expires_at())
-                    .unwrap_or_else(|_| Duration::from_secs(0))
-                    .as_millis(),
-                request.prepare.expires_at(),
-                SystemTime::now()
+                now.signed_duration_since(expires_at).num_milliseconds(),
+                expires_at.to_rfc3339(),
+                expires_at.to_rfc3339(),
             );
             let result = Box::new(err(RejectBuilder {
                 code: ErrorCode::R00_TRANSFER_TIMED_OUT,
                 message: &[],
-                triggered_by: None,
+                triggered_by: Some(&self.store.get_ilp_address()),
                 data: &[],
             }
             .build()));
@@ -80,9 +85,10 @@ where
     }
 }
 
-impl<O, A> OutgoingService<A> for ValidatorService<O, A>
+impl<O, S, A> OutgoingService<A> for ValidatorService<O, S, A>
 where
     O: OutgoingService<A>,
+    S: AddressStore,
     A: Account,
 {
     type Future = BoxedIlpFuture;
@@ -99,28 +105,30 @@ where
         let mut condition: [u8; 32] = [0; 32];
         condition[..].copy_from_slice(request.prepare.execution_condition()); // why?
 
-        if let Ok(time_left) = request
-            .prepare
-            .expires_at()
-            .duration_since(SystemTime::now())
-        {
+        let expires_at = DateTime::<Utc>::from(request.prepare.expires_at());
+        let now = Utc::now();
+        let time_left = expires_at - now;
+        let ilp_address = self.store.get_ilp_address();
+        let ilp_address_clone = ilp_address.clone();
+        if time_left > Duration::zero() {
             Box::new(
                 self.next
                     .send_request(request)
-                    .timeout(time_left)
+                    .timeout(time_left.to_std().expect("Time left must be positive"))
                     .map_err(move |err| {
                         // If the error was caused by the timer, into_inner will return None
                         if let Some(reject) = err.into_inner() {
                             reject
                         } else {
                             error!(
-                                "Outgoing request timed out after {}ms",
-                                time_left.as_millis()
+                                "Outgoing request timed out after {}ms (expiry was: {})",
+                                time_left.num_milliseconds(),
+                                expires_at,
                             );
                             RejectBuilder {
                                 code: ErrorCode::R00_TRANSFER_TIMED_OUT,
                                 message: &[],
-                                triggered_by: None,
+                                triggered_by: Some(&ilp_address_clone),
                                 data: &[],
                             }
                             .build()
@@ -135,7 +143,7 @@ where
                             Err(RejectBuilder {
                                 code: ErrorCode::F09_INVALID_PEER_RESPONSE,
                                 message: b"Fulfillment did not match condition",
-                                triggered_by: None,
+                                triggered_by: Some(&ilp_address),
                                 data: &[],
                             }
                             .build())
@@ -145,16 +153,13 @@ where
         } else {
             error!(
                 "Outgoing packet expired {}ms ago",
-                SystemTime::now()
-                    .duration_since(request.prepare.expires_at())
-                    .unwrap_or_default()
-                    .as_millis(),
+                (Duration::zero() - time_left).num_milliseconds(),
             );
             // Already expired
             Box::new(err(RejectBuilder {
                 code: ErrorCode::R00_TRANSFER_TIMED_OUT,
                 message: &[],
-                triggered_by: None,
+                triggered_by: Some(&ilp_address),
                 data: &[],
             }
             .build()))
@@ -162,6 +167,17 @@ where
     }
 }
 
+#[cfg(test)]
+use interledger_packet::Address;
+#[cfg(test)]
+use lazy_static::lazy_static;
+#[cfg(test)]
+use std::str::FromStr;
+#[cfg(test)]
+lazy_static! {
+    pub static ref ALICE: Username = Username::from_str("alice").unwrap();
+    pub static ref EXAMPLE_ADDRESS: Address = Address::from_str("example.alice").unwrap();
+}
 #[cfg(test)]
 #[derive(Clone, Debug)]
 struct TestAccount(u64);
@@ -172,6 +188,47 @@ impl Account for TestAccount {
     fn id(&self) -> u64 {
         self.0
     }
+
+    fn username(&self) -> &Username {
+        &ALICE
+    }
+
+    fn asset_code(&self) -> &str {
+        "XYZ"
+    }
+
+    // All connector accounts use asset scale = 9.
+    fn asset_scale(&self) -> u8 {
+        9
+    }
+
+    fn ilp_address(&self) -> &Address {
+        &EXAMPLE_ADDRESS
+    }
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+struct TestStore;
+
+#[cfg(test)]
+impl AddressStore for TestStore {
+    /// Saves the ILP Address in the store's memory and database
+    fn set_ilp_address(
+        &self,
+        _ilp_address: Address,
+    ) -> Box<dyn Future<Item = (), Error = ()> + Send> {
+        unimplemented!()
+    }
+
+    fn clear_ilp_address(&self) -> Box<dyn Future<Item = (), Error = ()> + Send> {
+        unimplemented!()
+    }
+
+    /// Get's the store's ilp address from memory
+    fn get_ilp_address(&self) -> Address {
+        Address::from_str("example.connector").unwrap()
+    }
 }
 
 #[cfg(test)]
@@ -179,24 +236,26 @@ mod incoming {
     use super::*;
     use interledger_packet::*;
     use interledger_service::incoming_service_fn;
-    use std::str::FromStr;
     use std::{
         sync::{Arc, Mutex},
-        time::SystemTime,
+        time::{Duration, SystemTime},
     };
 
     #[test]
     fn lets_through_valid_incoming_packet() {
         let requests = Arc::new(Mutex::new(Vec::new()));
         let requests_clone = requests.clone();
-        let mut validator = ValidatorService::incoming(incoming_service_fn(move |request| {
-            requests_clone.lock().unwrap().push(request);
-            Ok(FulfillBuilder {
-                fulfillment: &[0; 32],
-                data: b"test data",
-            }
-            .build())
-        }));
+        let mut validator = ValidatorService::incoming(
+            TestStore,
+            incoming_service_fn(move |request| {
+                requests_clone.lock().unwrap().push(request);
+                Ok(FulfillBuilder {
+                    fulfillment: &[0; 32],
+                    data: b"test data",
+                }
+                .build())
+            }),
+        );
         let result = validator
             .handle_request(IncomingRequest {
                 from: TestAccount(0),
@@ -222,14 +281,17 @@ mod incoming {
     fn rejects_expired_incoming_packet() {
         let requests = Arc::new(Mutex::new(Vec::new()));
         let requests_clone = requests.clone();
-        let mut validator = ValidatorService::incoming(incoming_service_fn(move |request| {
-            requests_clone.lock().unwrap().push(request);
-            Ok(FulfillBuilder {
-                fulfillment: &[0; 32],
-                data: b"test data",
-            }
-            .build())
-        }));
+        let mut validator = ValidatorService::incoming(
+            TestStore,
+            incoming_service_fn(move |request| {
+                requests_clone.lock().unwrap().push(request);
+                Ok(FulfillBuilder {
+                    fulfillment: &[0; 32],
+                    data: b"test data",
+                }
+                .build())
+            }),
+        );
         let result = validator
             .handle_request(IncomingRequest {
                 from: TestAccount(0),
@@ -263,21 +325,46 @@ mod outgoing {
     use std::str::FromStr;
     use std::{
         sync::{Arc, Mutex},
-        time::SystemTime,
+        time::{Duration, SystemTime},
     };
+
+    #[derive(Clone)]
+    struct TestStore;
+
+    impl AddressStore for TestStore {
+        /// Saves the ILP Address in the store's memory and database
+        fn set_ilp_address(
+            &self,
+            _ilp_address: Address,
+        ) -> Box<dyn Future<Item = (), Error = ()> + Send> {
+            unimplemented!()
+        }
+
+        fn clear_ilp_address(&self) -> Box<dyn Future<Item = (), Error = ()> + Send> {
+            unimplemented!()
+        }
+
+        /// Get's the store's ilp address from memory
+        fn get_ilp_address(&self) -> Address {
+            Address::from_str("example.connector").unwrap()
+        }
+    }
 
     #[test]
     fn lets_through_valid_outgoing_response() {
         let requests = Arc::new(Mutex::new(Vec::new()));
         let requests_clone = requests.clone();
-        let mut validator = ValidatorService::outgoing(outgoing_service_fn(move |request| {
-            requests_clone.lock().unwrap().push(request);
-            Ok(FulfillBuilder {
-                fulfillment: &[0; 32],
-                data: b"test data",
-            }
-            .build())
-        }));
+        let mut validator = ValidatorService::outgoing(
+            TestStore,
+            outgoing_service_fn(move |request| {
+                requests_clone.lock().unwrap().push(request);
+                Ok(FulfillBuilder {
+                    fulfillment: &[0; 32],
+                    data: b"test data",
+                }
+                .build())
+            }),
+        );
         let result = validator
             .send_request(OutgoingRequest {
                 from: TestAccount(1),
@@ -305,14 +392,17 @@ mod outgoing {
     fn returns_reject_instead_of_invalid_fulfillment() {
         let requests = Arc::new(Mutex::new(Vec::new()));
         let requests_clone = requests.clone();
-        let mut validator = ValidatorService::outgoing(outgoing_service_fn(move |request| {
-            requests_clone.lock().unwrap().push(request);
-            Ok(FulfillBuilder {
-                fulfillment: &[1; 32],
-                data: b"test data",
-            }
-            .build())
-        }));
+        let mut validator = ValidatorService::outgoing(
+            TestStore,
+            outgoing_service_fn(move |request| {
+                requests_clone.lock().unwrap().push(request);
+                Ok(FulfillBuilder {
+                    fulfillment: &[1; 32],
+                    data: b"test data",
+                }
+                .build())
+            }),
+        );
         let result = validator
             .send_request(OutgoingRequest {
                 from: TestAccount(1),

@@ -11,26 +11,29 @@ mod error;
 mod packet;
 mod server;
 
-pub use client::send_money;
+pub use client::{send_money, StreamDelivery};
 pub use error::Error;
-pub use server::{ConnectionGenerator, StreamReceiverService};
+pub use server::{
+    ConnectionGenerator, PaymentNotification, StreamNotificationsStore, StreamReceiverService,
+};
 
 #[cfg(test)]
 pub mod test_helpers {
-    use bytes::Bytes;
-    use futures::{future::ok, Future};
-    use interledger_ildcp::IldcpAccount;
+    use super::*;
+    use futures::{future::ok, sync::mpsc::UnboundedSender, Future};
     use interledger_packet::Address;
     use interledger_router::RouterStore;
-    use interledger_service::{Account, AccountStore};
+    use interledger_service::{Account, AccountStore, AddressStore, Username};
     use lazy_static::lazy_static;
     use std::collections::HashMap;
     use std::iter::FromIterator;
     use std::str::FromStr;
+    use std::sync::Arc;
 
     lazy_static! {
         pub static ref EXAMPLE_CONNECTOR: Address = Address::from_str("example.connector").unwrap();
         pub static ref EXAMPLE_RECEIVER: Address = Address::from_str("example.receiver").unwrap();
+        pub static ref ALICE: Username = Username::from_str("alice").unwrap();
     }
 
     #[derive(Debug, Eq, PartialEq, Clone)]
@@ -47,9 +50,11 @@ pub mod test_helpers {
         fn id(&self) -> u64 {
             self.id
         }
-    }
 
-    impl IldcpAccount for TestAccount {
+        fn username(&self) -> &Username {
+            &ALICE
+        }
+
         fn asset_code(&self) -> &str {
             self.asset_code.as_str()
         }
@@ -58,14 +63,30 @@ pub mod test_helpers {
             self.asset_scale
         }
 
-        fn client_address(&self) -> &Address {
+        fn ilp_address(&self) -> &Address {
             &self.ilp_address
         }
     }
 
     #[derive(Clone)]
+    pub struct DummyStore;
+
+    impl super::StreamNotificationsStore for DummyStore {
+        type Account = TestAccount;
+
+        fn add_payment_notification_subscription(
+            &self,
+            _account_id: u64,
+            _sender: UnboundedSender<PaymentNotification>,
+        ) {
+        }
+
+        fn publish_payment_notification(&self, _payment: PaymentNotification) {}
+    }
+
+    #[derive(Clone)]
     pub struct TestStore {
-        pub route: (Bytes, TestAccount),
+        pub route: (String, TestAccount),
     }
 
     impl AccountStore for TestStore {
@@ -77,11 +98,40 @@ pub mod test_helpers {
         ) -> Box<dyn Future<Item = Vec<TestAccount>, Error = ()> + Send> {
             Box::new(ok(vec![self.route.1.clone()]))
         }
+
+        // stub implementation (not used in these tests)
+        fn get_account_id_from_username(
+            &self,
+            _username: &Username,
+        ) -> Box<dyn Future<Item = u64, Error = ()> + Send> {
+            Box::new(ok(1))
+        }
     }
 
     impl RouterStore for TestStore {
-        fn routing_table(&self) -> HashMap<Bytes, u64> {
-            HashMap::from_iter(vec![(self.route.0.clone(), self.route.1.id())].into_iter())
+        fn routing_table(&self) -> Arc<HashMap<String, u64>> {
+            Arc::new(HashMap::from_iter(
+                vec![(self.route.0.clone(), self.route.1.id())].into_iter(),
+            ))
+        }
+    }
+
+    impl AddressStore for TestStore {
+        /// Saves the ILP Address in the store's memory and database
+        fn set_ilp_address(
+            &self,
+            _ilp_address: Address,
+        ) -> Box<dyn Future<Item = (), Error = ()> + Send> {
+            unimplemented!()
+        }
+
+        fn clear_ilp_address(&self) -> Box<dyn Future<Item = (), Error = ()> + Send> {
+            unimplemented!()
+        }
+
+        /// Get's the store's ilp address from memory
+        fn get_ilp_address(&self) -> Address {
+            Address::from_str("example.connector").unwrap()
         }
     }
 }
@@ -111,11 +161,12 @@ mod send_money_to_receiver {
             asset_scale: 9,
         };
         let store = TestStore {
-            route: (destination_address.to_bytes(), account),
+            route: (destination_address.to_string(), account),
         };
         let connection_generator = ConnectionGenerator::new(server_secret.clone());
         let server = StreamReceiverService::new(
             server_secret,
+            DummyStore,
             outgoing_service_fn(|_| {
                 Err(RejectBuilder {
                     code: ErrorCode::F02_UNREACHABLE,
@@ -145,8 +196,8 @@ mod send_money_to_receiver {
             &shared_secret[..],
             100,
         )
-        .and_then(|(delivered_amount, _service)| {
-            assert_eq!(delivered_amount, 100);
+        .and_then(|(receipt, _service)| {
+            assert_eq!(receipt.delivered_amount, 100);
             Ok(())
         })
         .map_err(|err| panic!(err));
