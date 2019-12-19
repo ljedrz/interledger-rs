@@ -222,6 +222,7 @@ mod echo_tests {
     use ring::rand::{SecureRandom, SystemRandom};
     use std::str::FromStr;
     use std::time::{Duration, SystemTime};
+    use uuid::Uuid;
 
     lazy_static! {
         pub static ref ALICE: Username = Username::from_str("alice").unwrap();
@@ -251,11 +252,10 @@ mod echo_tests {
     }
 
     #[derive(Debug, Clone)]
-    struct TestAccount(u64);
+    struct TestAccount(Uuid);
 
     impl Account for TestAccount {
-        type AccountId = u64;
-        fn id(&self) -> u64 {
+        fn id(&self) -> Uuid {
             self.0
         }
 
@@ -314,7 +314,7 @@ mod echo_tests {
             source_address: &source_address,
         }
         .build();
-        let from = TestAccount(1);
+        let from = TestAccount(Uuid::new_v4());
 
         // test
         let result = echo_service
@@ -360,7 +360,7 @@ mod echo_tests {
             data,
         }
         .build();
-        let from = TestAccount(1);
+        let from = TestAccount(Uuid::new_v4());
 
         // test
         let result = echo_service
@@ -406,7 +406,7 @@ mod echo_tests {
             source_address: &source_address,
         }
         .build();
-        let from = TestAccount(1);
+        let from = TestAccount(Uuid::new_v4());
 
         // test
         let result = echo_service
@@ -447,7 +447,7 @@ mod echo_tests {
             data,
         }
         .build();
-        let from = TestAccount(1);
+        let from = TestAccount(Uuid::new_v4());
 
         // test
         let result = echo_service
@@ -489,7 +489,7 @@ mod echo_tests {
             data,
         }
         .build();
-        let from = TestAccount(1);
+        let from = TestAccount(Uuid::new_v4());
 
         // test
         let result = echo_service

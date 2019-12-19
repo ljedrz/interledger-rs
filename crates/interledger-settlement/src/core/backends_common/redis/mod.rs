@@ -1,13 +1,11 @@
-use bytes::Bytes;
-use futures::{future::result, Future};
-use http::StatusCode;
-
 use crate::core::{
     idempotency::{IdempotentData, IdempotentStore},
     scale_with_precision_loss,
     types::{Convert, ConvertDetails, LeftoversStore},
 };
-
+use bytes::Bytes;
+use futures::{future::result, Future};
+use http::StatusCode;
 use num_bigint::BigUint;
 use redis_crate::{
     self, aio::SharedConnection, cmd, Client, ConnectionInfo, ErrorKind, FromRedisValue,
@@ -22,7 +20,7 @@ use log::{debug, error, trace};
 mod test_helpers;
 
 static UNCREDITED_AMOUNT_KEY: &str = "uncredited_engine_settlement_amount";
-fn uncredited_amount_key(account_id: String) -> String {
+fn uncredited_amount_key(account_id: &str) -> String {
     format!("{}:{}", UNCREDITED_AMOUNT_KEY, account_id)
 }
 
@@ -228,7 +226,7 @@ impl LeftoversStore for EngineRedisStore {
     ) -> Box<dyn Future<Item = (Self::AssetType, u8), Error = ()> + Send> {
         Box::new(
             cmd("LRANGE")
-                .arg(uncredited_amount_key(account_id.to_string()))
+                .arg(uncredited_amount_key(&account_id))
                 .arg(0)
                 .arg(-1)
                 .query_async(self.connection.clone())
@@ -253,7 +251,7 @@ impl LeftoversStore for EngineRedisStore {
             // When loading the amounts, we convert them to the appropriate data
             // type and sum them up.
             cmd("RPUSH")
-                .arg(uncredited_amount_key(account_id))
+                .arg(uncredited_amount_key(&account_id))
                 .arg(AmountWithScale {
                     num: uncredited_settlement_amount.0,
                     scale: uncredited_settlement_amount.1,
@@ -280,9 +278,9 @@ impl LeftoversStore for EngineRedisStore {
                         scale_with_precision_loss(amount.0, local_scale, amount.1);
                     let mut pipe = redis_crate::pipe();
                     pipe.atomic();
-                    pipe.del(uncredited_amount_key(account_id.clone())).ignore();
+                    pipe.del(uncredited_amount_key(&account_id)).ignore();
                     pipe.rpush(
-                        uncredited_amount_key(account_id),
+                        uncredited_amount_key(&account_id),
                         AmountWithScale {
                             num: precision_loss,
                             scale: std::cmp::max(local_scale, amount.1),
@@ -306,7 +304,7 @@ impl LeftoversStore for EngineRedisStore {
         trace!("Clearing uncredited_settlement_amount {:?}", account_id,);
         Box::new(
             cmd("DEL")
-                .arg(uncredited_amount_key(account_id))
+                .arg(uncredited_amount_key(&account_id))
                 .query_async(self.connection.clone())
                 .map_err(move |err| {
                     error!("Error clearing uncredited_settlement_amount: {:?}", err)

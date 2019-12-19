@@ -9,6 +9,7 @@ use interledger_settlement::core::types::{SettlementAccount, SettlementStore};
 use interledger_stream::StreamNotificationsStore;
 use serde::{de, Deserialize, Serialize};
 use std::{boxed::*, collections::HashMap, fmt::Display, net::SocketAddr, str::FromStr};
+use uuid::Uuid;
 use warp::{self, Filter};
 mod routes;
 use interledger_btp::{BtpAccount, BtpOutgoingService};
@@ -78,20 +79,17 @@ pub trait NodeStore: AddressStore + Clone + Send + Sync + 'static {
         account: AccountDetails,
     ) -> Box<dyn Future<Item = Self::Account, Error = ()> + Send>;
 
-    fn delete_account(
-        &self,
-        id: <Self::Account as Account>::AccountId,
-    ) -> Box<dyn Future<Item = Self::Account, Error = ()> + Send>;
+    fn delete_account(&self, id: Uuid) -> Box<dyn Future<Item = Self::Account, Error = ()> + Send>;
 
     fn update_account(
         &self,
-        id: <Self::Account as Account>::AccountId,
+        id: Uuid,
         account: AccountDetails,
     ) -> Box<dyn Future<Item = Self::Account, Error = ()> + Send>;
 
     fn modify_account_settings(
         &self,
-        id: <Self::Account as Account>::AccountId,
+        id: Uuid,
         settings: AccountSettings,
     ) -> Box<dyn Future<Item = Self::Account, Error = ()> + Send>;
 
@@ -100,18 +98,15 @@ pub trait NodeStore: AddressStore + Clone + Send + Sync + 'static {
 
     fn set_static_routes<R>(&self, routes: R) -> Box<dyn Future<Item = (), Error = ()> + Send>
     where
-        R: IntoIterator<Item = (String, <Self::Account as Account>::AccountId)>;
+        R: IntoIterator<Item = (String, Uuid)>;
 
     fn set_static_route(
         &self,
         prefix: String,
-        account_id: <Self::Account as Account>::AccountId,
+        account_id: Uuid,
     ) -> Box<dyn Future<Item = (), Error = ()> + Send>;
 
-    fn set_default_route(
-        &self,
-        account_id: <Self::Account as Account>::AccountId,
-    ) -> Box<dyn Future<Item = (), Error = ()> + Send>;
+    fn set_default_route(&self, account_id: Uuid) -> Box<dyn Future<Item = (), Error = ()> + Send>;
 
     fn set_settlement_engines(
         &self,

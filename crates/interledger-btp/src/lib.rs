@@ -18,7 +18,7 @@ mod server;
 mod service;
 
 pub use self::client::{connect_client, connect_to_service_account, parse_btp_url};
-pub use self::server::create_btp_service_and_filter;
+pub use self::server::btp_service_as_filter;
 pub use self::service::{BtpOutgoingService, BtpService};
 
 pub trait BtpAccount: Account {
@@ -57,6 +57,7 @@ mod client_server {
         time::{Duration, SystemTime},
     };
     use tokio::runtime::Runtime;
+    use uuid::Uuid;
 
     use lazy_static::lazy_static;
 
@@ -78,16 +79,14 @@ mod client_server {
 
     #[derive(Clone, Debug)]
     pub struct TestAccount {
-        pub id: u64,
+        pub id: Uuid,
         pub ilp_over_btp_incoming_token: Option<String>,
         pub ilp_over_btp_outgoing_token: Option<String>,
         pub ilp_over_btp_url: Option<Url>,
     }
 
     impl Account for TestAccount {
-        type AccountId = u64;
-
-        fn id(&self) -> u64 {
+        fn id(&self) -> Uuid {
             self.id
         }
 
@@ -132,7 +131,7 @@ mod client_server {
 
         fn get_accounts(
             &self,
-            account_ids: Vec<<<Self as AccountStore>::Account as Account>::AccountId>,
+            account_ids: Vec<Uuid>,
         ) -> Box<dyn Future<Item = Vec<Self::Account>, Error = ()> + Send> {
             let accounts: Vec<TestAccount> = self
                 .accounts
@@ -156,8 +155,8 @@ mod client_server {
         fn get_account_id_from_username(
             &self,
             _username: &Username,
-        ) -> Box<dyn Future<Item = u64, Error = ()> + Send> {
-            Box::new(ok(1))
+        ) -> Box<dyn Future<Item = Uuid, Error = ()> + Send> {
+            Box::new(ok(Uuid::new_v4()))
         }
     }
 
@@ -169,13 +168,12 @@ mod client_server {
             username: &Username,
             token: &str,
         ) -> Box<dyn Future<Item = Self::Account, Error = ()> + Send> {
-            let saved_token = format!("{}:{}", username, token);
             Box::new(result(
                 self.accounts
                     .iter()
                     .find(|account| {
                         if let Some(account_token) = &account.ilp_over_btp_incoming_token {
-                            account_token == &saved_token
+                            account_token == token && account.username() == username
                         } else {
                             false
                         }
@@ -207,16 +205,15 @@ mod client_server {
 
                 let server_store = TestStore {
                     accounts: Arc::new(vec![TestAccount {
-                        id: 0,
-                        ilp_over_btp_incoming_token: Some("alice:test_auth_token".to_string()),
+                        id: Uuid::new_v4(),
+                        ilp_over_btp_incoming_token: Some("test_auth_token".to_string()),
                         ilp_over_btp_outgoing_token: None,
                         ilp_over_btp_url: None,
                     }]),
                 };
                 let server_address = Address::from_str("example.server").unwrap();
-                let (btp_service, filter) = create_btp_service_and_filter(
+                let btp_service = BtpOutgoingService::new(
                     server_address.clone(),
-                    server_store,
                     outgoing_service_fn(move |_| {
                         Err(RejectBuilder {
                             code: ErrorCode::F02_UNREACHABLE,
@@ -227,6 +224,7 @@ mod client_server {
                         .build())
                     }),
                 );
+                let filter = btp_service_as_filter(btp_service.clone(), server_store);
                 btp_service.handle_incoming(incoming_service_fn(|_| {
                     Ok(FulfillBuilder {
                         fulfillment: &[0; 32],
@@ -234,12 +232,14 @@ mod client_server {
                     }
                     .build())
                 }));
-                let server = warp::serve(filter);
 
                 let account = TestAccount {
-                    id: 0,
-                    ilp_over_btp_url: Some(Url::parse(&format!("btp+ws://{}", bind_addr)).unwrap()),
-                    ilp_over_btp_outgoing_token: Some("alice:test_auth_token".to_string()),
+                    id: Uuid::new_v4(),
+                    ilp_over_btp_url: Some(
+                        Url::parse(&format!("btp+ws://{}/accounts/alice/ilp/btp", bind_addr))
+                            .unwrap(),
+                    ),
+                    ilp_over_btp_outgoing_token: Some("test_auth_token".to_string()),
                     ilp_over_btp_incoming_token: None,
                 };
                 let accounts = vec![account.clone()];
@@ -291,6 +291,7 @@ mod client_server {
                             Ok(())
                         })
                 });
+                let server = warp::serve(filter);
                 tokio::spawn(server.bind(bind_addr));
                 client
             }))

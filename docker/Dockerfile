@@ -3,17 +3,18 @@ FROM clux/muslrust:stable as rust
 
 WORKDIR /usr/src/interledger-rs
 COPY ./Cargo.toml /usr/src/interledger-rs/Cargo.toml
+COPY ./Cargo.lock /usr/src/interledger-rs/Cargo.lock
 COPY ./crates /usr/src/interledger-rs/crates
 
 # TODO: investigate using a method like https://whitfin.io/speeding-up-rust-docker-builds/
 # to ensure that the dependencies are cached so the build doesn't take as long
-# RUN cargo build --all-features --package ilp-node --package interledger-settlement-engines --package ilp-cli
+# RUN cargo build --all-features --package ilp-node --package ilp-cli
 RUN cargo build --release --all-features --package ilp-node --package ilp-cli
 
 WORKDIR /usr/src/
 RUN git clone https://github.com/interledger-rs/settlement-engines.git
 WORKDIR /usr/src/settlement-engines
-RUN cargo build --release --all-features --package interledger-settlement-engines
+RUN cargo build --release --all-features --package ilp-settlement-ethereum
 
 FROM node:12-alpine
 
@@ -39,8 +40,8 @@ COPY --from=rust \
     /usr/src/interledger-rs/target/x86_64-unknown-linux-musl/release/ilp-cli \
     /usr/local/bin/ilp-cli
 COPY --from=rust \
-    /usr/src/settlement-engines/target/x86_64-unknown-linux-musl/release/interledger-settlement-engines \
-    /usr/local/bin/interledger-settlement-engines
+    /usr/src/settlement-engines/target/x86_64-unknown-linux-musl/release/ilp-settlement-ethereum \
+    /usr/local/bin/ilp-settlement-ethereum
 # COPY --from=rust \
 #     /usr/src/interledger-rs/target/x86_64-unknown-linux-musl/debug/ilp-node \
 #     /usr/local/bin/ilp-node
@@ -48,8 +49,8 @@ COPY --from=rust \
 #     /usr/src/interledger-rs/target/x86_64-unknown-linux-musl/debug/ilp-cli \
 #     /usr/local/bin/ilp-cli
 # COPY --from=rust \
-#     /usr/src/settlement-engines/target/x86_64-unknown-linux-musl/debug/interledger-settlement-engines \
-#     /usr/local/bin/interledger-settlement-engines
+#     /usr/src/settlement-engines/target/x86_64-unknown-linux-musl/debug/ilp-settlement-ethereum \
+#     /usr/local/bin/ilp-settlement-ethereum
 
 WORKDIR /opt/app
 
@@ -59,7 +60,7 @@ COPY ./docker/redis.conf redis.conf
 COPY ./docker/run-testnet-bundle.js run-testnet-bundle.js
 
 # ENV RUST_BACKTRACE=1
-ENV RUST_LOG=interledger=debug
+ENV RUST_LOG=interledger=debug,ilp_settlement_ethereum=debug
 
 # In order for the node to access the config file, you need to mount
 # the directory with the node's config.yml file as a Docker volume

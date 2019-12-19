@@ -81,6 +81,7 @@ mod tests {
     use interledger_packet::{Address, ErrorCode, FulfillBuilder, PrepareBuilder, RejectBuilder};
     use interledger_service::{outgoing_service_fn, Username};
     use std::str::FromStr;
+    use uuid::Uuid;
 
     use lazy_static::lazy_static;
 
@@ -90,11 +91,9 @@ mod tests {
     }
 
     #[derive(Clone, Debug)]
-    struct TestAccount(u64, u32);
+    struct TestAccount(Uuid, u32);
     impl Account for TestAccount {
-        type AccountId = u64;
-
-        fn id(&self) -> u64 {
+        fn id(&self) -> Uuid {
             self.0
         }
 
@@ -146,8 +145,8 @@ mod tests {
         }));
         service
             .send_request(OutgoingRequest {
-                from: TestAccount(0, 600),
-                to: TestAccount(1, 700),
+                from: TestAccount(Uuid::new_v4(), 600),
+                to: TestAccount(Uuid::new_v4(), 700),
                 prepare: PrepareBuilder {
                     destination: Address::from_str("example.destination").unwrap(),
                     amount: 10,
@@ -185,8 +184,8 @@ mod tests {
         }));
         service
             .send_request(OutgoingRequest {
-                from: TestAccount(0, 500),
-                to: TestAccount(1, 500),
+                from: TestAccount(Uuid::new_v4(), 500),
+                to: TestAccount(Uuid::new_v4(), 500),
                 prepare: PrepareBuilder {
                     destination: Address::from_str("example.destination").unwrap(),
                     amount: 10,

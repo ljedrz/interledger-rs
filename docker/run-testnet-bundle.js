@@ -68,6 +68,7 @@ async function run() {
             --ilp-over-http-url=https://${config.nodeName}.localtunnel.me/ilp \
             --settle-threshold=1000 \
             --settle-to=0`)
+            // TODO: The outgoing token and HTTP url should be replaced with the new format
     }
 
     console.log('Using config: ', config)
@@ -129,12 +130,12 @@ function runNode({ httpBindAddress, adminAuthToken, secretSeed, nodeName }) {
         `--http_bind_address=${httpBindAddress}`,
         `--admin_auth_token=${adminAuthToken}`,
         `--secret_seed=${secretSeed}`,
-        '--redis_url=unix:/tmp/redis.sock',
+        '--redis_url=redis+unix:/tmp/redis.sock',
         `--default_spsp_account=${nodeName}`
     ],
         {
             env: {
-                'ILP_EXCHANGE_RATE_PROVIDER': 'CoinCap',
+                'ILP_EXCHANGE_RATE__PROVIDER': 'CoinCap',
                 'RUST_LOG': process.env.RUST_LOG || 'interledger=debug',
                 'RUST_BACKTRACE': process.env.RUST_BACKTRACE || '1'
             },
@@ -163,18 +164,17 @@ function runXrpSettlementEngine() {
 
 function runEthSettlementEngine({ ethKey, ethUrl }) {
     console.log('Starting ETH settlement engine...')
-    const eth = spawn('interledger-settlement-engines', [
-        'ethereum-ledger',
+    const eth = spawn('ilp-settlement-ethereum', [
         '--settlement_api_bind_address=127.0.0.1:3002',
         `--ethereum_url=${ethUrl}`,
         `--private_key=${ethKey}`,
         '--poll_frequency=15000',
         '--confirmations=0',
-        '--redis_url=unix:/tmp/redis.sock?db=2',
+        '--redis_url=redis+unix:/tmp/redis.sock?db=2',
         '--chain_id=4'
     ], {
         env: {
-            'RUST_LOG': process.env.RUST_LOG || 'interledger=debug',
+            'RUST_LOG': process.env.RUST_LOG || 'interledger=debug,ilp_settlement_ethereum=debug',
             'RUST_BACKTRACE': process.env.RUST_BACKTRACE || '1'
         },
         stdio: 'inherit'

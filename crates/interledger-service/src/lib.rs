@@ -29,18 +29,14 @@
 use futures::{Future, IntoFuture};
 use interledger_packet::{Address, Fulfill, Prepare, Reject};
 use std::{
-    cmp::Eq,
-    fmt::{self, Debug, Display},
-    hash::Hash,
+    fmt::{self, Debug},
     marker::PhantomData,
-    str::FromStr,
     sync::Arc,
 };
+use uuid::Uuid;
 
-use serde::Serialize;
-
-mod auth;
-pub use auth::{Auth as AuthToken, Username};
+mod username;
+pub use username::Username;
 #[cfg(feature = "trace")]
 mod trace;
 #[cfg(feature = "trace")]
@@ -53,9 +49,7 @@ pub use trace::*;
 /// Store implementations will implement these Account traits for a concrete type that
 /// they will load from the database.
 pub trait Account: Clone + Send + Sized + Debug {
-    type AccountId: Eq + Hash + Debug + Display + Default + FromStr + Send + Sync + Copy + Serialize;
-
-    fn id(&self) -> Self::AccountId;
+    fn id(&self) -> Uuid;
     fn username(&self) -> &Username;
     fn ilp_address(&self) -> &Address;
     fn asset_scale(&self) -> u8;
@@ -172,16 +166,13 @@ pub trait AccountStore {
 
     fn get_accounts(
         &self,
-        account_ids: Vec<<<Self as AccountStore>::Account as Account>::AccountId>,
+        account_ids: Vec<Uuid>,
     ) -> Box<dyn Future<Item = Vec<Self::Account>, Error = ()> + Send>;
 
     fn get_account_id_from_username(
         &self,
         username: &Username,
-    ) -> Box<
-        dyn Future<Item = <<Self as AccountStore>::Account as Account>::AccountId, Error = ()>
-            + Send,
-    >;
+    ) -> Box<dyn Future<Item = Uuid, Error = ()> + Send>;
 }
 
 /// Create an IncomingService that calls the given handler for each request.

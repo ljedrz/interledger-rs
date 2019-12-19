@@ -29,6 +29,7 @@ pub mod test_helpers {
     use std::iter::FromIterator;
     use std::str::FromStr;
     use std::sync::Arc;
+    use uuid::Uuid;
 
     lazy_static! {
         pub static ref EXAMPLE_CONNECTOR: Address = Address::from_str("example.connector").unwrap();
@@ -38,16 +39,14 @@ pub mod test_helpers {
 
     #[derive(Debug, Eq, PartialEq, Clone)]
     pub struct TestAccount {
-        pub id: u64,
+        pub id: Uuid,
         pub ilp_address: Address,
         pub asset_scale: u8,
         pub asset_code: String,
     }
 
     impl Account for TestAccount {
-        type AccountId = u64;
-
-        fn id(&self) -> u64 {
+        fn id(&self) -> Uuid {
             self.id
         }
 
@@ -76,7 +75,7 @@ pub mod test_helpers {
 
         fn add_payment_notification_subscription(
             &self,
-            _account_id: u64,
+            _account_id: Uuid,
             _sender: UnboundedSender<PaymentNotification>,
         ) {
         }
@@ -94,7 +93,7 @@ pub mod test_helpers {
 
         fn get_accounts(
             &self,
-            _account_ids: Vec<<<Self as AccountStore>::Account as Account>::AccountId>,
+            _account_ids: Vec<Uuid>,
         ) -> Box<dyn Future<Item = Vec<TestAccount>, Error = ()> + Send> {
             Box::new(ok(vec![self.route.1.clone()]))
         }
@@ -103,13 +102,13 @@ pub mod test_helpers {
         fn get_account_id_from_username(
             &self,
             _username: &Username,
-        ) -> Box<dyn Future<Item = u64, Error = ()> + Send> {
-            Box::new(ok(1))
+        ) -> Box<dyn Future<Item = Uuid, Error = ()> + Send> {
+            Box::new(ok(Uuid::new_v4()))
         }
     }
 
     impl RouterStore for TestStore {
-        fn routing_table(&self) -> Arc<HashMap<String, u64>> {
+        fn routing_table(&self) -> Arc<HashMap<String, Uuid>> {
             Arc::new(HashMap::from_iter(
                 vec![(self.route.0.clone(), self.route.1.id())].into_iter(),
             ))
@@ -149,13 +148,14 @@ mod send_money_to_receiver {
     use interledger_service::outgoing_service_fn;
     use std::str::FromStr;
     use tokio::runtime::Runtime;
+    use uuid::Uuid;
 
     #[test]
     fn send_money_test() {
         let server_secret = Bytes::from(&[0; 32][..]);
         let destination_address = Address::from_str("example.receiver").unwrap();
         let account = TestAccount {
-            id: 0,
+            id: Uuid::new_v4(),
             ilp_address: destination_address.clone(),
             asset_code: "XYZ".to_string(),
             asset_scale: 9,
@@ -187,7 +187,7 @@ mod send_money_to_receiver {
         let run = send_money(
             server,
             &test_helpers::TestAccount {
-                id: 0,
+                id: Uuid::new_v4(),
                 asset_code: "XYZ".to_string(),
                 asset_scale: 9,
                 ilp_address: destination_address,

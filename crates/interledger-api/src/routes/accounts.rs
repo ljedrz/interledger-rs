@@ -11,7 +11,7 @@ use interledger_ildcp::IldcpRequest;
 use interledger_ildcp::IldcpResponse;
 use interledger_router::RouterStore;
 use interledger_service::{
-    Account, AddressStore, AuthToken, IncomingService, OutgoingRequest, OutgoingService, Username,
+    Account, AddressStore, IncomingService, OutgoingRequest, OutgoingService, Username,
 };
 use interledger_service_util::{BalanceStore, ExchangeRateStore};
 use interledger_settlement::core::types::SettlementAccount;
@@ -21,8 +21,10 @@ use log::{debug, error, trace};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::convert::TryFrom;
-use std::str::FromStr;
+use uuid::Uuid;
 use warp::{self, Filter, Rejection};
+
+pub const BEARER_TOKEN_START: usize = 7;
 
 #[derive(Deserialize, Debug)]
 struct SpspPayRequest {
@@ -39,7 +41,7 @@ pub fn accounts_api<I, O, S, A, B>(
     outgoing_handler: O,
     btp: BtpOutgoingService<B, A>,
     store: S,
-) -> warp::filters::BoxedFilter<(impl warp::Reply,)>
+) -> impl warp::Filter<Extract = (impl warp::Reply,), Error = warp::Rejection> + Clone
 where
     I: IncomingService<A> + Clone + Send + Sync + 'static,
     O: OutgoingService<A> + Clone + Send + Sync + 'static,
@@ -124,10 +126,13 @@ where
         .and(with_admin_auth_header.clone())
         .and_then(
             |path_username: Username, auth_string: String, store: S, admin_auth_header: String| {
-                store.get_account_id_from_username(&path_username).then(
-                    move |account_id: Result<A::AccountId, _>| {
+                if auth_string.len() < BEARER_TOKEN_START {
+                    return Either::A(err(ApiError::bad_request().into()));
+                }
+                Either::B(store.get_account_id_from_username(&path_username).then(
+                    move |account_id: Result<Uuid, _>| {
                         if account_id.is_err() {
-                            return Either::A(err::<A::AccountId, Rejection>(
+                            return Either::A(err::<Uuid, Rejection>(
                                 ApiError::account_not_found().into(),
                             ));
                         }
@@ -135,13 +140,12 @@ where
                         if auth_string == admin_auth_header {
                             return Either::A(ok(account_id));
                         }
-                        let auth = match AuthToken::from_str(&auth_string) {
-                            Ok(auth) => auth,
-                            Err(_) => return Either::A(err(ApiError::account_not_found().into())),
-                        };
                         Either::B(
                             store
-                                .get_account_from_http_auth(auth.username(), auth.password())
+                                .get_account_from_http_auth(
+                                    &path_username,
+                                    &auth_string[BEARER_TOKEN_START..],
+                                )
                                 .then(move |authorized_account: Result<A, _>| {
                                     if authorized_account.is_err() {
                                         return err(ApiError::unauthorized().into());
@@ -155,7 +159,7 @@ where
                                 }),
                         )
                     },
-                )
+                ))
             },
         )
         .boxed();
@@ -166,15 +170,12 @@ where
         .and(warp::header::<String>("authorization"))
         .and(with_store.clone())
         .and_then(|path_username: Username, auth_string: String, store: S| {
-            let auth: AuthToken = match AuthToken::from_str(&auth_string) {
-                Ok(auth) => auth,
-                Err(_) => {
-                    return Either::A(err::<A, Rejection>(ApiError::account_not_found().into()))
-                }
-            };
+            if auth_string.len() < BEARER_TOKEN_START {
+                return Either::A(err(ApiError::bad_request().into()));
+            }
             Either::B(
                 store
-                    .get_account_from_http_auth(auth.username(), auth.password())
+                    .get_account_from_http_auth(&path_username, &auth_string[BEARER_TOKEN_START..])
                     .then(move |authorized_account: Result<A, _>| {
                         if authorized_account.is_err() {
                             return err::<A, Rejection>(ApiError::unauthorized().into());
@@ -236,20 +237,18 @@ where
         .and(admin_only.clone())
         .and(deserialize_json())
         .and(with_store.clone())
-        .and_then(
-            move |id: A::AccountId, account_details: AccountDetails, store: S| {
-                let store_clone = store.clone();
-                let handler = outgoing_handler.clone();
-                let btp = btp.clone();
-                store
-                    .update_account(id, account_details)
-                    .map_err::<_, Rejection>(move |_| ApiError::internal_server_error().into())
-                    .and_then(move |account| {
-                        connect_to_external_services(handler, account, store_clone, btp)
-                    })
-                    .and_then(|account: A| Ok(warp::reply::json(&account)))
-            },
-        )
+        .and_then(move |id: Uuid, account_details: AccountDetails, store: S| {
+            let store_clone = store.clone();
+            let handler = outgoing_handler.clone();
+            let btp = btp.clone();
+            store
+                .update_account(id, account_details)
+                .map_err::<_, Rejection>(move |_| ApiError::internal_server_error().into())
+                .and_then(move |account| {
+                    connect_to_external_services(handler, account, store_clone, btp)
+                })
+                .and_then(|account: A| Ok(warp::reply::json(&account)))
+        })
         .boxed();
 
     // GET /accounts/:username
@@ -258,7 +257,7 @@ where
         .and(warp::path::end())
         .and(admin_or_authorized_user_only.clone())
         .and(with_store.clone())
-        .and_then(|id: A::AccountId, store: S| {
+        .and_then(|id: Uuid, store: S| {
             store
                 .get_accounts(vec![id])
                 .map_err::<_, Rejection>(|_| ApiError::account_not_found().into())
@@ -273,23 +272,29 @@ where
         .and(warp::path::end())
         .and(admin_or_authorized_user_only.clone())
         .and(with_store.clone())
-        .and_then(|id: A::AccountId, store: S| {
+        .and_then(|id: Uuid, store: S| {
             // TODO reduce the number of store calls it takes to get the balance
             store
                 .get_accounts(vec![id])
                 .map_err(|_| warp::reject::not_found())
                 .and_then(move |mut accounts| {
+                    let account = accounts.pop().unwrap();
+                    let acc_clone = account.clone();
+                    let asset_scale = acc_clone.asset_scale();
+                    let asset_code = acc_clone.asset_code().to_owned();
                     store
-                        .get_balance(accounts.pop().unwrap())
+                        .get_balance(account)
                         .map_err(move |_| {
                             error!("Error getting balance for account: {}", id);
                             ApiError::internal_server_error().into()
                         })
-                })
-                .and_then(|balance: i64| {
-                    Ok(warp::reply::json(&json!({
-                        "balance": balance,
-                    })))
+                        .and_then(move |balance: i64| {
+                            Ok(warp::reply::json(&json!({
+                                // normalize to the base unit
+                                "balance": balance as f64 / 10_u64.pow(asset_scale.into()) as f64,
+                                "asset_code": asset_code,
+                            })))
+                        })
                 })
         })
         .boxed();
@@ -300,7 +305,7 @@ where
         .and(warp::path::end())
         .and(admin_only.clone())
         .and(with_store.clone())
-        .and_then(|id: A::AccountId, store: S| {
+        .and_then(|id: Uuid, store: S| {
             store
                 .delete_account(id)
                 .map_err::<_, Rejection>(move |_| {
@@ -319,7 +324,7 @@ where
         .and(admin_or_authorized_user_only.clone())
         .and(deserialize_json())
         .and(with_store.clone())
-        .and_then(|id: A::AccountId, settings: AccountSettings, store: S| {
+        .and_then(|id: Uuid, settings: AccountSettings, store: S| {
             store
                 .modify_account_settings(id, settings)
                 .map_err::<_, Rejection>(move |_| {
@@ -339,7 +344,7 @@ where
         .and(admin_or_authorized_user_only.clone())
         .and(warp::ws2())
         .and(with_store.clone())
-        .map(|id: A::AccountId, ws: warp::ws::Ws2, store: S| {
+        .map(|id: Uuid, ws: warp::ws::Ws2, store: S| {
             ws.on_upgrade(move |ws: warp::ws::WebSocket| {
                 let (tx, rx) = futures::sync::mpsc::unbounded::<PaymentNotification>();
                 store.add_payment_notification_subscription(id, tx);
@@ -390,7 +395,7 @@ where
         .and(warp::path("spsp"))
         .and(warp::path::end())
         .and(with_store.clone())
-        .and_then(move |id: A::AccountId, store: S| {
+        .and_then(move |id: Uuid, store: S| {
             let server_secret_clone = server_secret_clone.clone();
             store
                 .get_accounts(vec![id])
@@ -618,4 +623,127 @@ where
             }
         })
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::routes::test_helpers::*;
+
+    #[test]
+    fn only_admin_can_create_account() {
+        let api = test_accounts_api();
+        let resp = api_call(&api, "POST", "/accounts", "admin", DETAILS.clone());
+        assert_eq!(resp.status().as_u16(), 200);
+
+        let resp = api_call(&api, "POST", "/accounts", "wrong", DETAILS.clone());
+        assert_eq!(resp.status().as_u16(), 401);
+    }
+
+    #[test]
+    fn only_admin_can_delete_account() {
+        let api = test_accounts_api();
+        let resp = api_call(&api, "DELETE", "/accounts/alice", "admin", DETAILS.clone());
+        assert_eq!(resp.status().as_u16(), 200);
+
+        let resp = api_call(&api, "DELETE", "/accounts/alice", "wrong", DETAILS.clone());
+        assert_eq!(resp.status().as_u16(), 401);
+    }
+
+    #[test]
+    fn only_admin_can_modify_whole_account() {
+        let api = test_accounts_api();
+        let resp = api_call(&api, "PUT", "/accounts/alice", "admin", DETAILS.clone());
+        assert_eq!(resp.status().as_u16(), 200);
+
+        let resp = api_call(&api, "PUT", "/accounts/alice", "wrong", DETAILS.clone());
+        assert_eq!(resp.status().as_u16(), 401);
+    }
+
+    #[test]
+    fn only_admin_can_get_all_accounts() {
+        let api = test_accounts_api();
+        let resp = api_call(&api, "GET", "/accounts", "admin", DETAILS.clone());
+        assert_eq!(resp.status().as_u16(), 200);
+
+        let resp = api_call(&api, "GET", "/accounts", "wrong", DETAILS.clone());
+        assert_eq!(resp.status().as_u16(), 401);
+    }
+
+    #[test]
+    fn only_admin_or_user_can_get_account() {
+        let api = test_accounts_api();
+        let resp = api_call(&api, "GET", "/accounts/alice", "admin", DETAILS.clone());
+        assert_eq!(resp.status().as_u16(), 200);
+
+        // TODO: Make this not require the username in the token
+        let resp = api_call(&api, "GET", "/accounts/alice", "password", DETAILS.clone());
+        assert_eq!(resp.status().as_u16(), 200);
+
+        let resp = api_call(&api, "GET", "/accounts/alice", "wrong", DETAILS.clone());
+        assert_eq!(resp.status().as_u16(), 401);
+    }
+
+    #[test]
+    fn only_admin_or_user_can_get_accounts_balance() {
+        let api = test_accounts_api();
+        let resp = api_call(
+            &api,
+            "GET",
+            "/accounts/alice/balance",
+            "admin",
+            DETAILS.clone(),
+        );
+        assert_eq!(resp.status().as_u16(), 200);
+
+        // TODO: Make this not require the username in the token
+        let resp = api_call(
+            &api,
+            "GET",
+            "/accounts/alice/balance",
+            "password",
+            DETAILS.clone(),
+        );
+        assert_eq!(resp.status().as_u16(), 200);
+
+        let resp = api_call(
+            &api,
+            "GET",
+            "/accounts/alice/balance",
+            "wrong",
+            DETAILS.clone(),
+        );
+        assert_eq!(resp.status().as_u16(), 401);
+    }
+
+    #[test]
+    fn only_admin_or_user_can_modify_accounts_settings() {
+        let api = test_accounts_api();
+        let resp = api_call(
+            &api,
+            "PUT",
+            "/accounts/alice/settings",
+            "admin",
+            DETAILS.clone(),
+        );
+        assert_eq!(resp.status().as_u16(), 200);
+
+        // TODO: Make this not require the username in the token
+        let resp = api_call(
+            &api,
+            "PUT",
+            "/accounts/alice/settings",
+            "password",
+            DETAILS.clone(),
+        );
+        assert_eq!(resp.status().as_u16(), 200);
+
+        let resp = api_call(
+            &api,
+            "PUT",
+            "/accounts/alice/settings",
+            "wrong",
+            DETAILS.clone(),
+        );
+        assert_eq!(resp.status().as_u16(), 401);
+    }
 }

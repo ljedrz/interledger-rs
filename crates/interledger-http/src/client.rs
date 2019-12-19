@@ -1,9 +1,6 @@
 use super::{HttpAccount, HttpStore};
 use bytes::BytesMut;
-use futures::{
-    future::{err, result},
-    Future, Stream,
-};
+use futures::{future::result, Future, Stream};
 use interledger_packet::{Address, ErrorCode, Fulfill, Packet, Reject, RejectBuilder};
 use interledger_service::*;
 use log::{error, trace};
@@ -11,7 +8,7 @@ use reqwest::{
     header::{HeaderMap, HeaderName, HeaderValue},
     r#async::{Chunk, Client, ClientBuilder, Response as HttpResponse},
 };
-use std::str::FromStr;
+use secrecy::{ExposeSecret, SecretString};
 use std::{convert::TryFrom, marker::PhantomData, sync::Arc, time::Duration};
 
 #[derive(Clone)]
@@ -67,23 +64,17 @@ where
                 request.to.id(),
                 url.as_str()
             );
-            let token = request.to.get_http_auth_token().unwrap_or("");
-            let auth = match AuthToken::from_str(token) {
-                Ok(auth) => auth,
-                Err(_) => {
-                    return Box::new(err(RejectBuilder {
-                        code: ErrorCode::T00_INTERNAL_ERROR,
-                        message: &[],
-                        triggered_by: None,
-                        data: &[],
-                    }
-                    .build()))
-                }
-            };
+            let token = request
+                .to
+                .get_http_auth_token()
+                .unwrap_or_else(|| SecretString::new("".to_owned()));
             Box::new(
                 self.client
                     .post(url.as_ref())
-                    .header("authorization", auth.to_bearer())
+                    .header(
+                        "authorization",
+                        &format!("Bearer {}", token.expose_secret()),
+                    )
                     .body(BytesMut::from(request.prepare).freeze())
                     .send()
                     .map_err(move |err| {

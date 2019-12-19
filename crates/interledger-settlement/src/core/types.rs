@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use std::ops::{Div, Mul};
 use std::str::FromStr;
 use url::Url;
+use uuid::Uuid;
 
 // Account without an engine error
 pub const NO_ENGINE_CONFIGURED_ERROR_TYPE: ApiErrorType = ApiErrorType {
@@ -96,20 +97,20 @@ pub trait SettlementStore {
 
     fn update_balance_for_incoming_settlement(
         &self,
-        account_id: <Self::Account as Account>::AccountId,
+        account_id: Uuid,
         amount: u64,
         idempotency_key: Option<String>,
     ) -> Box<dyn Future<Item = (), Error = ()> + Send>;
 
     fn refund_settlement(
         &self,
-        account_id: <Self::Account as Account>::AccountId,
+        account_id: Uuid,
         settle_amount: u64,
     ) -> Box<dyn Future<Item = (), Error = ()> + Send>;
 }
 
 pub trait LeftoversStore {
-    type AccountId;
+    type AccountId: ToString;
     type AssetType: ToString;
 
     /// Saves the leftover data

@@ -36,7 +36,7 @@ To run the Interledger.rs components by themselves (rather than the `testnet-bun
 ```bash #
 docker pull interledgerrs/node
 docker pull interledgerrs/ilp-cli
-docker pull interledgerrs/settlement-engines
+docker pull interledgerrs/ilp-settlement-ethereum
 ```
 
 #### Run
@@ -48,8 +48,8 @@ docker run -it interledgerrs/node
 # This is a simple CLI for interacting with the node's HTTP API
 docker run -it --rm interledgerrs/ilp-cli
 
-# This includes the Settlement Engines written in Rust
-docker run -it interledgerrs/settlement-engines
+# This includes the Ethereum Settlement Engines written in Rust
+docker run -it interledgerrs/ilp-settlement-ethereum
 ```
 
 ### Building From Source
@@ -57,6 +57,7 @@ docker run -it interledgerrs/settlement-engines
 #### Prerequisites
 
 - Git
+- [Redis](https://redis.io/)
 - [Rust](https://www.rust-lang.org/tools/install) - latest stable version
 
 #### Install
@@ -75,14 +76,30 @@ You can find the Interledger Settlement Engines in a [separate repository](https
 
 ```bash #
 # This runs the ilp-node
-cargo run -p ilp-node -- # Put CLI args after the "--"
+cargo run --bin ilp-node -- # Put CLI args after the "--"
 
-cargo run -p ilp-cli -- # Put CLI args after the "--"
+cargo run --bin ilp-cli -- # Put CLI args after the "--"
 ```
 
 Append the `--help` flag to see available options.
 
 See [configuration](./docs/configuration.md) for more details on how the node is configured.
+
+#### Configuring Redis
+
+We have some account settings such as `amount_per_minute_limit` or `packets_per_minute_limit`. In order to enable these options, you need to load the [redis-cell](https://github.com/brandur/redis-cell) module as follows. *You don't need to load this module unless you use the rate-limit options.*
+
+```
+# in your redis config file
+# libredis_cell.so file will be found in crates/interledger-store/external
+loadmodule /path/to/modules/libredis_cell.so
+```
+
+or you can specify an argument when you start up the redis instance as follows.
+
+```
+redis-server --loadmodule /path/to/modules/libredis_cell.so
+```
 
 ## Examples
 

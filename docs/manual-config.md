@@ -30,7 +30,7 @@ If you want to just try out the Interledger testnet, you could try as follows.
 ```bash
 curl \
     -X POST \
-    -H "Authorization: Bearer ${username}:${token}" \
+    -H "Authorization: Bearer ${token}" \
     -H "Content-Type: application/json" \
     -d '{"receiver":"$their-payment-pointer.example","source_amount":500}' \
     https://rs3.xpring.dev/accounts/${Username}/payments
@@ -42,7 +42,7 @@ If someone sends you payments, you could confirm your balance increase as follow
 
 ```bash
 curl \
-    -H "Authorization: Bearer ${username}:${token}" \
+    -H "Authorization: Bearer ${token}" \
     https://rs3.xpring.dev/accounts/${Username}/balance
 ```
 
@@ -147,10 +147,14 @@ Note that we have to spin up a Redis which the settlement engine is going to con
 To spin up a Ethereum settlement engine,
 
 ```bash
+# This should be done outside of the interledger-rs directory, otherwise it will cause an error.
+git clone https://github.com/interledger-rs/settlement-engines
+cd settlement-engines
+
 mkdir -p logs
 redis-server --port 6380 &> logs/redis_se.log &
 
-cargo run --all-features --bin interledger-settlement-engines -- ethereum-ledger \
+cargo run --bin ilp-settlement-ethereum -- \
 --private_key "${SE_ETH_SECRET}" \
 --chain_id 4 \
 --confirmations 0 \
@@ -179,7 +183,7 @@ First, save your config file as `config.json` which contains:
 {
     "secret_seed": "<secret_seed>",
     "admin_auth_token": "<admin_auth_token>",
-    "redis_url": "redis://127.0.0.1:6379/",
+    "database_url": "redis://127.0.0.1:6379/",
     "http_bind_address": "127.0.0.1:7770",
     "settlement_api_bind_address": "127.0.0.1:7771"
 }

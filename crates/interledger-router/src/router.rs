@@ -153,9 +153,10 @@ mod tests {
     use std::str::FromStr;
     use std::sync::Arc;
     use std::time::UNIX_EPOCH;
+    use uuid::Uuid;
 
     #[derive(Debug, Clone)]
-    struct TestAccount(u64);
+    struct TestAccount(Uuid);
 
     lazy_static! {
         pub static ref ALICE: Username = Username::from_str("alice").unwrap();
@@ -163,8 +164,7 @@ mod tests {
     }
 
     impl Account for TestAccount {
-        type AccountId = u64;
-        fn id(&self) -> u64 {
+        fn id(&self) -> Uuid {
             self.0
         }
 
@@ -187,7 +187,7 @@ mod tests {
 
     #[derive(Clone)]
     struct TestStore {
-        routes: HashMap<String, u64>,
+        routes: HashMap<String, Uuid>,
     }
 
     impl AccountStore for TestStore {
@@ -195,7 +195,7 @@ mod tests {
 
         fn get_accounts(
             &self,
-            account_ids: Vec<<<Self as AccountStore>::Account as Account>::AccountId>,
+            account_ids: Vec<Uuid>,
         ) -> Box<dyn Future<Item = Vec<TestAccount>, Error = ()> + Send> {
             Box::new(ok(account_ids.into_iter().map(TestAccount).collect()))
         }
@@ -204,8 +204,8 @@ mod tests {
         fn get_account_id_from_username(
             &self,
             _username: &Username,
-        ) -> Box<dyn Future<Item = u64, Error = ()> + Send> {
-            Box::new(ok(1))
+        ) -> Box<dyn Future<Item = Uuid, Error = ()> + Send> {
+            Box::new(ok(Uuid::new_v4()))
         }
     }
 
@@ -229,7 +229,7 @@ mod tests {
     }
 
     impl RouterStore for TestStore {
-        fn routing_table(&self) -> Arc<HashMap<String, u64>> {
+        fn routing_table(&self) -> Arc<HashMap<String, Uuid>> {
             Arc::new(self.routes.clone())
         }
     }
@@ -251,7 +251,7 @@ mod tests {
 
         let result = router
             .handle_request(IncomingRequest {
-                from: TestAccount(0),
+                from: TestAccount(Uuid::new_v4()),
                 prepare: PrepareBuilder {
                     destination: Address::from_str("example.destination").unwrap(),
                     amount: 100,
@@ -269,7 +269,9 @@ mod tests {
     fn no_route() {
         let mut router = Router::new(
             TestStore {
-                routes: HashMap::from_iter(vec![("example.other".to_string(), 1)].into_iter()),
+                routes: HashMap::from_iter(
+                    vec![("example.other".to_string(), Uuid::new_v4())].into_iter(),
+                ),
             },
             outgoing_service_fn(|_| {
                 Ok(FulfillBuilder {
@@ -282,7 +284,7 @@ mod tests {
 
         let result = router
             .handle_request(IncomingRequest {
-                from: TestAccount(0),
+                from: TestAccount(Uuid::new_v4()),
                 prepare: PrepareBuilder {
                     destination: Address::from_str("example.destination").unwrap(),
                     amount: 100,
@@ -301,7 +303,7 @@ mod tests {
         let mut router = Router::new(
             TestStore {
                 routes: HashMap::from_iter(
-                    vec![("example.destination".to_string(), 1)].into_iter(),
+                    vec![("example.destination".to_string(), Uuid::new_v4())].into_iter(),
                 ),
             },
             outgoing_service_fn(|_| {
@@ -315,7 +317,7 @@ mod tests {
 
         let result = router
             .handle_request(IncomingRequest {
-                from: TestAccount(0),
+                from: TestAccount(Uuid::new_v4()),
                 prepare: PrepareBuilder {
                     destination: Address::from_str("example.destination").unwrap(),
                     amount: 100,
@@ -333,7 +335,7 @@ mod tests {
     fn catch_all_route() {
         let mut router = Router::new(
             TestStore {
-                routes: HashMap::from_iter(vec![(String::new(), 0)].into_iter()),
+                routes: HashMap::from_iter(vec![(String::new(), Uuid::new_v4())].into_iter()),
             },
             outgoing_service_fn(|_| {
                 Ok(FulfillBuilder {
@@ -346,7 +348,7 @@ mod tests {
 
         let result = router
             .handle_request(IncomingRequest {
-                from: TestAccount(0),
+                from: TestAccount(Uuid::new_v4()),
                 prepare: PrepareBuilder {
                     destination: Address::from_str("example.destination").unwrap(),
                     amount: 100,
@@ -364,7 +366,9 @@ mod tests {
     fn finds_matching_prefix() {
         let mut router = Router::new(
             TestStore {
-                routes: HashMap::from_iter(vec![("example.".to_string(), 1)].into_iter()),
+                routes: HashMap::from_iter(
+                    vec![("example.".to_string(), Uuid::new_v4())].into_iter(),
+                ),
             },
             outgoing_service_fn(|_| {
                 Ok(FulfillBuilder {
@@ -377,7 +381,7 @@ mod tests {
 
         let result = router
             .handle_request(IncomingRequest {
-                from: TestAccount(0),
+                from: TestAccount(Uuid::new_v4()),
                 prepare: PrepareBuilder {
                     destination: Address::from_str("example.destination").unwrap(),
                     amount: 100,
@@ -393,15 +397,18 @@ mod tests {
 
     #[test]
     fn finds_longest_matching_prefix() {
+        let id0 = Uuid::from_slice(&[0; 16]).unwrap();
+        let id1 = Uuid::from_slice(&[1; 16]).unwrap();
+        let id2 = Uuid::from_slice(&[2; 16]).unwrap();
         let to: Arc<Mutex<Option<TestAccount>>> = Arc::new(Mutex::new(None));
         let to_clone = to.clone();
         let mut router = Router::new(
             TestStore {
                 routes: HashMap::from_iter(
                     vec![
-                        (String::new(), 0),
-                        ("example.destination".to_string(), 2),
-                        ("example.".to_string(), 1),
+                        (String::new(), id0),
+                        ("example.destination".to_string(), id2),
+                        ("example.".to_string(), id1),
                     ]
                     .into_iter(),
                 ),
@@ -419,7 +426,7 @@ mod tests {
 
         let result = router
             .handle_request(IncomingRequest {
-                from: TestAccount(0),
+                from: TestAccount(id0),
                 prepare: PrepareBuilder {
                     destination: Address::from_str("example.destination").unwrap(),
                     amount: 100,
@@ -431,6 +438,6 @@ mod tests {
             })
             .wait();
         assert!(result.is_ok());
-        assert_eq!(to.lock().take().unwrap().0, 2);
+        assert_eq!(to.lock().take().unwrap().0, id2);
     }
 }

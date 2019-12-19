@@ -16,12 +16,13 @@ mod server;
 pub use client::{pay, query};
 pub use server::SpspResponder;
 
+// TODO should these error variants be renamed to remove the 'Error' suffix from each one?
 #[derive(Fail, Debug)]
 pub enum Error {
     #[fail(display = "Unable to query SPSP server: {:?}", _0)]
     HttpError(String),
     #[fail(display = "Got invalid SPSP response from server: {:?}", _0)]
-    InvalidResponseError(String),
+    InvalidSpspServerResponseError(String),
     #[fail(display = "STREAM error: {}", _0)]
     StreamError(StreamError),
     #[fail(display = "Error sending money: {}", _0)]

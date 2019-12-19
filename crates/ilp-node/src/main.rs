@@ -1,9 +1,19 @@
-#![type_length_limit = "1119051"]
+#![type_length_limit = "1152909"]
+
+mod metrics;
+mod node;
+mod trace;
+
+#[cfg(feature = "google-pubsub")]
+mod google_pubsub;
+#[cfg(feature = "redis")]
+mod redis_store;
 
 use clap::{crate_version, App, Arg, ArgMatches};
 use config::{Config, Source};
 use config::{FileFormat, Value};
 use libc::{c_int, isatty};
+use node::InterledgerNode;
 use std::{
     ffi::{OsStr, OsString},
     io::Read,
@@ -13,13 +23,6 @@ use tracing_subscriber::{
     filter::EnvFilter,
     fmt::{time::ChronoUtc, Subscriber},
 };
-
-#[cfg(feature = "google-pubsub")]
-mod google_pubsub;
-mod metrics;
-mod node;
-mod trace;
-use node::InterledgerNode;
 
 pub fn main() {
     Subscriber::builder()
@@ -69,8 +72,10 @@ pub fn main() {
             .takes_value(true)
             .required(true)
             .help("HTTP Authorization token for the node admin (sent as a Bearer token)"),
-        Arg::with_name("redis_url")
-            .long("redis_url")
+        Arg::with_name("database_url")
+            .long("database_url")
+            // temporary alias for backwards compatibility
+            .alias("redis_url")
             .takes_value(true)
             .default_value("redis://127.0.0.1:6379")
             .help("Redis URI (for example, \"redis://127.0.0.1:6379\" or \"unix:/tmp/redis.sock\")"),
@@ -90,24 +95,40 @@ pub fn main() {
             .long("route_broadcast_interval")
             .takes_value(true)
             .help("Interval, defined in milliseconds, on which the node will broadcast routing information to other nodes using CCP. Defaults to 30000ms (30 seconds)."),
-        Arg::with_name("exchange_rate_provider")
-            .long("exchange_rate_provider")
+        Arg::with_name("exchange_rate.provider")
+            .long("exchange_rate.provider")
             .takes_value(true)
             .help("Exchange rate API to poll for exchange rates. If this is not set, the node will not poll for rates and will instead use the rates set via the HTTP API. \
                 Note that CryptoCompare can also be used when the node is configured via a config file or stdin, because an API key must be provided to use that service."),
-        Arg::with_name("exchange_rate_poll_interval")
-            .long("exchange_rate_poll_interval")
+        Arg::with_name("exchange_rate.poll_interval")
+            .long("exchange_rate.poll_interval")
             .default_value("60000")
-            .help("Interval, defined in milliseconds, on which the node will poll the exchange_rate_provider (if specified) for exchange rates."),
-        Arg::with_name("exchange_rate_spread")
-            .long("exchange_rate_spread")
+            .help("Interval, defined in milliseconds, on which the node will poll the exchange_rate.provider (if specified) for exchange rates."),
+        Arg::with_name("exchange_rate.spread")
+            .long("exchange_rate.spread")
             .default_value("0")
             .help("Spread, as a fraction, to add on top of the exchange rate. \
                 This amount is kept as the node operator's profit, or may cover \
                 fluctuations in exchange rates.
                 For example, take an incoming packet with an amount of 100. If the \
-                exchange rate is 1:2 and the spread is 0.01, the amount on the \
-                    outgoing packet would be 198 (instead of 200 without the spread).")
+                exchange rate is 1:0.5 and the spread is 0.01, the amount on the \
+                    outgoing packet would be 198 (instead of 200 without the spread)."),
+        Arg::with_name("prometheus.bind_address")
+            .long("prometheus.bind_address")
+            .takes_value(true)
+            .help("IP address and port to host the Prometheus endpoint on."),
+        Arg::with_name("prometheus.histogram_window")
+            .long("prometheus.histogram_window")
+            .takes_value(true)
+            .help("Amount of time, in milliseconds, that the node will collect data \
+                points for the Prometheus histograms. Defaults to 300000ms (5 minutes)."),
+        Arg::with_name("prometheus.histogram_granularity")
+            .long("prometheus.histogram_granularity")
+            .takes_value(true)
+            .help("Granularity, in milliseconds, that the node will use to roll off \
+                old data. For example, a value of 1000ms (1 second) would mean that the \
+                node forgets the oldest 1 second of histogram data points every second. \
+                Defaults to 10000ms (10 seconds)."),
         ]);
 
     let mut config = get_env_config("ilp");

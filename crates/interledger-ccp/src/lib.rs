@@ -13,6 +13,7 @@ use futures::Future;
 use interledger_service::Account;
 use std::collections::HashMap;
 use std::{fmt, str::FromStr};
+use uuid::Uuid;
 
 #[cfg(test)]
 mod fixtures;
@@ -107,7 +108,7 @@ pub trait RouteManagerStore: Clone {
 
     fn get_accounts_to_send_routes_to(
         &self,
-        ignore_accounts: Vec<<Self::Account as Account>::AccountId>,
+        ignore_accounts: Vec<Uuid>,
     ) -> Box<dyn Future<Item = Vec<Self::Account>, Error = ()> + Send>;
 
     fn get_accounts_to_receive_routes_from(

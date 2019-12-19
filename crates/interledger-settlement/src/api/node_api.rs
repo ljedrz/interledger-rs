@@ -24,6 +24,7 @@ use std::{
     str::{self, FromStr},
     time::{Duration, SystemTime},
 };
+use uuid::Uuid;
 use warp::{self, reject::Rejection, Filter};
 
 static PEER_PROTOCOL_CONDITION: [u8; 32] = [
@@ -36,7 +37,7 @@ pub fn create_settlements_filter<S, O, A>(
     outgoing_handler: O,
 ) -> warp::filters::BoxedFilter<(impl warp::Reply,)>
 where
-    S: LeftoversStore<AccountId = <A as Account>::AccountId, AssetType = BigUint>
+    S: LeftoversStore<AccountId = Uuid, AssetType = BigUint>
         + SettlementStore<Account = A>
         + IdempotentStore
         + AccountStore<Account = A>
@@ -151,7 +152,7 @@ fn do_receive_settlement<S, A>(
     idempotency_key: Option<String>,
 ) -> Box<dyn Future<Item = ApiResponse, Error = ApiError> + Send>
 where
-    S: LeftoversStore<AccountId = <A as Account>::AccountId, AssetType = BigUint>
+    S: LeftoversStore<AccountId = Uuid, AssetType = BigUint>
         + SettlementStore<Account = A>
         + IdempotentStore
         + AccountStore<Account = A>
@@ -166,7 +167,7 @@ where
     let engine_scale = body.scale;
 
     // Convert to the desired data types
-    let account_id = match A::AccountId::from_str(&account_id) {
+    let account_id = match Uuid::from_str(&account_id) {
         Ok(a) => a,
         Err(_) => {
             let error_msg = format!("Unable to parse account id: {}", account_id);
@@ -264,7 +265,7 @@ fn do_send_outgoing_message<S, O, A>(
     body: Vec<u8>,
 ) -> Box<dyn Future<Item = ApiResponse, Error = ApiError> + Send>
 where
-    S: LeftoversStore<AccountId = <A as Account>::AccountId, AssetType = BigUint>
+    S: LeftoversStore<AssetType = BigUint>
         + SettlementStore<Account = A>
         + IdempotentStore
         + AccountStore<Account = A>
@@ -275,7 +276,7 @@ where
     O: OutgoingService<A> + Clone + Send + Sync + 'static,
     A: SettlementAccount + Account + Send + Sync + 'static,
 {
-    Box::new(result(A::AccountId::from_str(&account_id)
+    Box::new(result(Uuid::from_str(&account_id)
             .map_err(move |_| {
                 let err = ApiError::invalid_account_id(Some(&account_id));
                 error!("{}", err);
@@ -535,11 +536,11 @@ mod tests {
             let api = test_api(store.clone(), false);
 
             let response = settlement_call(&api, &id, 100, 18, Some(IDEMPOTENCY));
-            check_error_status_and_message(response, 404, "Account 0 does not have settlement engine details configured. Cannot handle incoming settlement");
+            check_error_status_and_message(response, 404, "Account 00000000-0000-0000-0000-000000000000 does not have settlement engine details configured. Cannot handle incoming settlement");
 
             // check that it's idempotent
             let response = settlement_call(&api, &id, 100, 18, Some(IDEMPOTENCY));
-            check_error_status_and_message(response, 404, "Account 0 does not have settlement engine details configured. Cannot handle incoming settlement");
+            check_error_status_and_message(response, 404, "Account 00000000-0000-0000-0000-000000000000 does not have settlement engine details configured. Cannot handle incoming settlement");
 
             let s = store.clone();
             let cache = s.cache.read();
@@ -548,7 +549,7 @@ mod tests {
             let cache_hits = s.cache_hits.read();
             assert_eq!(*cache_hits, 1);
             assert_eq!(cached_data.status, 404);
-            assert_eq!(cached_data.body, &Bytes::from("Account 0 does not have settlement engine details configured. Cannot handle incoming settlement"));
+            assert_eq!(cached_data.body, &Bytes::from("Account 00000000-0000-0000-0000-000000000000 does not have settlement engine details configured. Cannot handle incoming settlement"));
         }
 
         #[test]
@@ -594,10 +595,18 @@ mod tests {
             let api = test_api(store.clone(), false);
 
             let ret = settlement_call(&api, &id, 100, 18, Some(IDEMPOTENCY));
-            check_error_status_and_message(ret, 404, "Account 0 was not found");
+            check_error_status_and_message(
+                ret,
+                404,
+                "Account 00000000-0000-0000-0000-000000000000 was not found",
+            );
 
             let ret = settlement_call(&api, &id, 100, 18, Some(IDEMPOTENCY));
-            check_error_status_and_message(ret, 404, "Account 0 was not found");
+            check_error_status_and_message(
+                ret,
+                404,
+                "Account 00000000-0000-0000-0000-000000000000 was not found",
+            );
 
             let s = store.clone();
             let cache = s.cache.read();
@@ -605,7 +614,10 @@ mod tests {
             let cache_hits = s.cache_hits.read();
             assert_eq!(*cache_hits, 1);
             assert_eq!(cached_data.status, 404);
-            assert_eq!(cached_data.body, &Bytes::from("Account 0 was not found"));
+            assert_eq!(
+                cached_data.body,
+                &Bytes::from("Account 00000000-0000-0000-0000-000000000000 was not found")
+            );
         }
     }
 
@@ -737,10 +749,18 @@ mod tests {
             let api = test_api(store.clone(), true);
 
             let ret = messages_call(&api, &id, &[], Some(IDEMPOTENCY));
-            check_error_status_and_message(ret, 404, "Account 0 was not found");
+            check_error_status_and_message(
+                ret,
+                404,
+                "Account 00000000-0000-0000-0000-000000000000 was not found",
+            );
 
             let ret = messages_call(&api, &id, &[], Some(IDEMPOTENCY));
-            check_error_status_and_message(ret, 404, "Account 0 was not found");
+            check_error_status_and_message(
+                ret,
+                404,
+                "Account 00000000-0000-0000-0000-000000000000 was not found",
+            );
 
             let s = store.clone();
             let cache = s.cache.read();
@@ -749,7 +769,10 @@ mod tests {
             let cache_hits = s.cache_hits.read();
             assert_eq!(*cache_hits, 1);
             assert_eq!(cached_data.status, 404);
-            assert_eq!(cached_data.body, &Bytes::from("Account 0 was not found"));
+            assert_eq!(
+                cached_data.body,
+                &Bytes::from("Account 00000000-0000-0000-0000-000000000000 was not found")
+            );
         }
     }
 }
