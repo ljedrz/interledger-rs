@@ -1,5 +1,5 @@
 use super::RouterStore;
-use futures::{future::err, Future};
+use async_trait::async_trait;
 use interledger_packet::{ErrorCode, RejectBuilder};
 use interledger_service::*;
 use log::{error, trace};
@@ -38,19 +38,18 @@ where
     }
 }
 
+#[async_trait]
 impl<S, O> IncomingService<S::Account> for Router<S, O>
 where
     S: AddressStore + RouterStore,
     O: OutgoingService<S::Account> + Clone + Send + 'static,
 {
-    type Future = BoxedIlpFuture;
-
     /// Figures out the next node to pass the received Prepare packet to.
     ///
     /// Firstly, it checks if there is a direct path for that account and uses that.
     /// If not it scans through the routing table and checks if the route prefix matches
     /// the prepare packet's destination or if it's a catch-all address (i.e. empty prefix)
-    fn handle_request(&mut self, request: IncomingRequest<S::Account>) -> Self::Future {
+    async fn handle_request(&mut self, request: IncomingRequest<S::Account>) -> IlpResult {
         let destination = request.prepare.destination();
         let mut next_hop = None;
         let routing_table = self.store.routing_table();
@@ -92,24 +91,22 @@ where
 
         if let Some(account_id) = next_hop {
             let mut next = self.next.clone();
-            Box::new(
-                self.store
-                    .get_accounts(vec![account_id])
-                    .map_err(move |_| {
-                        error!("No record found for account: {}", account_id);
-                        RejectBuilder {
-                            code: ErrorCode::F02_UNREACHABLE,
-                            message: &[],
-                            triggered_by: Some(&ilp_address),
-                            data: &[],
-                        }
-                        .build()
-                    })
-                    .and_then(move |mut accounts| {
-                        let request = request.into_outgoing(accounts.remove(0));
-                        next.send_request(request)
-                    }),
-            )
+            match self.store.get_accounts(vec![account_id]).await {
+                Ok(mut accounts) => {
+                    let request = request.into_outgoing(accounts.remove(0));
+                    next.send_request(request).await
+                }
+                Err(_) => {
+                    error!("No record found for account: {}", account_id);
+                    Err(RejectBuilder {
+                        code: ErrorCode::F02_UNREACHABLE,
+                        message: &[],
+                        triggered_by: Some(&ilp_address),
+                        data: &[],
+                    }
+                    .build())
+                }
+            }
         } else {
             error!(
                 "No route found for request {}: {:?}",
@@ -129,13 +126,13 @@ where
                 },
                 request
             );
-            Box::new(err(RejectBuilder {
+            Err(RejectBuilder {
                 code: ErrorCode::F02_UNREACHABLE,
                 message: &[],
                 triggered_by: Some(&ilp_address),
                 data: &[],
             }
-            .build()))
+            .build())
         }
     }
 }
@@ -143,10 +140,10 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use futures::future::ok;
+    use interledger_errors::*;
     use interledger_packet::{Address, FulfillBuilder, PrepareBuilder};
     use interledger_service::outgoing_service_fn;
-    use lazy_static::lazy_static;
+    use once_cell::sync::Lazy;
     use parking_lot::Mutex;
     use std::collections::HashMap;
     use std::iter::FromIterator;
@@ -158,10 +155,9 @@ mod tests {
     #[derive(Debug, Clone)]
     struct TestAccount(Uuid);
 
-    lazy_static! {
-        pub static ref ALICE: Username = Username::from_str("alice").unwrap();
-        pub static ref EXAMPLE_ADDRESS: Address = Address::from_str("example.alice").unwrap();
-    }
+    pub static ALICE: Lazy<Username> = Lazy::new(|| Username::from_str("alice").unwrap());
+    pub static EXAMPLE_ADDRESS: Lazy<Address> =
+        Lazy::new(|| Address::from_str("example.alice").unwrap());
 
     impl Account for TestAccount {
         fn id(&self) -> Uuid {
@@ -190,36 +186,35 @@ mod tests {
         routes: HashMap<String, Uuid>,
     }
 
+    #[async_trait]
     impl AccountStore for TestStore {
         type Account = TestAccount;
 
-        fn get_accounts(
+        async fn get_accounts(
             &self,
             account_ids: Vec<Uuid>,
-        ) -> Box<dyn Future<Item = Vec<TestAccount>, Error = ()> + Send> {
-            Box::new(ok(account_ids.into_iter().map(TestAccount).collect()))
+        ) -> Result<Vec<TestAccount>, AccountStoreError> {
+            Ok(account_ids.into_iter().map(TestAccount).collect())
         }
 
         // stub implementation (not used in these tests)
-        fn get_account_id_from_username(
+        async fn get_account_id_from_username(
             &self,
             _username: &Username,
-        ) -> Box<dyn Future<Item = Uuid, Error = ()> + Send> {
-            Box::new(ok(Uuid::new_v4()))
+        ) -> Result<Uuid, AccountStoreError> {
+            Ok(Uuid::new_v4())
         }
     }
 
+    #[async_trait]
     impl AddressStore for TestStore {
         /// Saves the ILP Address in the store's memory and database
-        fn set_ilp_address(
-            &self,
-            _ilp_address: Address,
-        ) -> Box<dyn Future<Item = (), Error = ()> + Send> {
-            unimplemented!()
+        async fn set_ilp_address(&self, _ilp_address: Address) -> Result<(), AddressStoreError> {
+            Ok(())
         }
 
-        fn clear_ilp_address(&self) -> Box<dyn Future<Item = (), Error = ()> + Send> {
-            unimplemented!()
+        async fn clear_ilp_address(&self) -> Result<(), AddressStoreError> {
+            Ok(())
         }
 
         /// Get's the store's ilp address from memory
@@ -234,8 +229,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn empty_routing_table() {
+    #[tokio::test]
+    async fn empty_routing_table() {
         let mut router = Router::new(
             TestStore {
                 routes: HashMap::new(),
@@ -261,12 +256,12 @@ mod tests {
                 }
                 .build(),
             })
-            .wait();
+            .await;
         assert!(result.is_err());
     }
 
-    #[test]
-    fn no_route() {
+    #[tokio::test]
+    async fn no_route() {
         let mut router = Router::new(
             TestStore {
                 routes: HashMap::from_iter(
@@ -294,12 +289,12 @@ mod tests {
                 }
                 .build(),
             })
-            .wait();
+            .await;
         assert!(result.is_err());
     }
 
-    #[test]
-    fn finds_exact_route() {
+    #[tokio::test]
+    async fn finds_exact_route() {
         let mut router = Router::new(
             TestStore {
                 routes: HashMap::from_iter(
@@ -327,12 +322,12 @@ mod tests {
                 }
                 .build(),
             })
-            .wait();
+            .await;
         assert!(result.is_ok());
     }
 
-    #[test]
-    fn catch_all_route() {
+    #[tokio::test]
+    async fn catch_all_route() {
         let mut router = Router::new(
             TestStore {
                 routes: HashMap::from_iter(vec![(String::new(), Uuid::new_v4())].into_iter()),
@@ -358,12 +353,12 @@ mod tests {
                 }
                 .build(),
             })
-            .wait();
+            .await;
         assert!(result.is_ok());
     }
 
-    #[test]
-    fn finds_matching_prefix() {
+    #[tokio::test]
+    async fn finds_matching_prefix() {
         let mut router = Router::new(
             TestStore {
                 routes: HashMap::from_iter(
@@ -391,12 +386,12 @@ mod tests {
                 }
                 .build(),
             })
-            .wait();
+            .await;
         assert!(result.is_ok());
     }
 
-    #[test]
-    fn finds_longest_matching_prefix() {
+    #[tokio::test]
+    async fn finds_longest_matching_prefix() {
         let id0 = Uuid::from_slice(&[0; 16]).unwrap();
         let id1 = Uuid::from_slice(&[1; 16]).unwrap();
         let id2 = Uuid::from_slice(&[2; 16]).unwrap();
@@ -414,7 +409,7 @@ mod tests {
                 ),
             },
             outgoing_service_fn(move |request: OutgoingRequest<TestAccount>| {
-                *to_clone.lock() = Some(request.to.clone());
+                *to_clone.lock() = Some(request.to);
 
                 Ok(FulfillBuilder {
                     fulfillment: &[0; 32],
@@ -436,7 +431,7 @@ mod tests {
                 }
                 .build(),
             })
-            .wait();
+            .await;
         assert!(result.is_ok());
         assert_eq!(to.lock().take().unwrap().0, id2);
     }

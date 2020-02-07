@@ -1,10 +1,14 @@
 use clap::ArgMatches;
 use http;
-use reqwest::{self, Client, Response};
-use std::{borrow::Cow, collections::HashMap};
+use reqwest::{
+    self,
+    blocking::{Client, Response},
+};
+use std::collections::HashMap;
 use tungstenite::{connect, handshake::client::Request};
 use url::Url;
 
+#[non_exhaustive]
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     // Custom errors
@@ -23,6 +27,8 @@ pub enum Error {
     UrlErr(#[from] url::ParseError),
     #[error("WebSocket error: {0}")]
     WebsocketErr(#[from] tungstenite::error::Error),
+    #[error("HTTP error: {0}")]
+    HttpErr(#[from] http::Error),
 }
 
 pub fn run(matches: &ArgMatches) -> Result<Response, Error> {
@@ -63,6 +69,7 @@ pub fn run(matches: &ArgMatches) -> Result<Response, Error> {
             _ => Err(Error::UsageErr("ilp-cli help settlement-engines")),
         },
         ("status", Some(status_matches)) => client.get_root(status_matches),
+        ("logs", Some(log_level)) => client.put_tracing_level(log_level),
         ("testnet", Some(testnet_matches)) => match testnet_matches.subcommand() {
             ("setup", Some(submatches)) => client.xpring_account(submatches),
             _ => Err(Error::UsageErr("ilp-cli help testnet")),
@@ -139,11 +146,10 @@ impl NodeClient<'_> {
 
         url.set_scheme(scheme).map_err(Error::SchemeErr)?;
 
-        let mut request: Request = url.into();
-        request.add_header(
-            Cow::Borrowed("Authorization"),
-            Cow::Owned(format!("Bearer {}", auth)),
-        );
+        let request: Request = Request::builder()
+            .uri(url.into_string())
+            .header("Authorization", format!("Bearer {}", auth))
+            .body(())?;
 
         let (mut socket, _) = connect(request)?;
         loop {
@@ -252,6 +258,17 @@ impl NodeClient<'_> {
             .put(&format!("{}/settlement/engines", self.url))
             .bearer_auth(auth)
             .json(&engine_pairs)
+            .send()
+            .map_err(Error::SendErr)
+    }
+
+    // PUT /tracing-level
+    fn put_tracing_level(&self, matches: &ArgMatches) -> Result<Response, Error> {
+        let (auth, args) = extract_args(matches);
+        self.client
+            .put(&format!("{}/tracing-level", self.url))
+            .bearer_auth(auth)
+            .body(args["level"].to_owned())
             .send()
             .map_err(Error::SendErr)
     }

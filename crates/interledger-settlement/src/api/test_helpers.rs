@@ -8,10 +8,6 @@ use crate::core::{
     },
 };
 use bytes::Bytes;
-use futures::{
-    future::{err, ok},
-    Future,
-};
 use hyper::StatusCode;
 use interledger_packet::{Address, ErrorCode, FulfillBuilder, RejectBuilder};
 use interledger_service::{
@@ -21,13 +17,15 @@ use mockito::mock;
 use num_bigint::BigUint;
 use uuid::Uuid;
 
-use super::fixtures::{BODY, MESSAGES_API, SERVICE_ADDRESS, SETTLEMENT_API, TEST_ACCOUNT_0};
-use lazy_static::lazy_static;
+use super::fixtures::{BODY, MESSAGES_API, SERVICE_ADDRESS, TEST_ACCOUNT_0};
+use async_trait::async_trait;
+use interledger_errors::*;
+use once_cell::sync::Lazy;
 use parking_lot::RwLock;
+use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::Arc;
-use tokio::runtime::Runtime;
 use url::Url;
 
 #[derive(Debug, Clone)]
@@ -39,9 +37,7 @@ pub struct TestAccount {
     pub balance: i64,
 }
 
-lazy_static! {
-    pub static ref ALICE: Username = Username::from_str("alice").unwrap();
-}
+pub static ALICE: Lazy<Username> = Lazy::new(|| Username::from_str("alice").unwrap());
 
 impl Account for TestAccount {
     fn id(&self) -> Uuid {
@@ -86,73 +82,82 @@ pub struct TestStore {
     pub uncredited_settlement_amount: Arc<RwLock<HashMap<Uuid, (BigUint, u8)>>>,
 }
 
+#[async_trait]
 impl SettlementStore for TestStore {
     type Account = TestAccount;
 
-    fn update_balance_for_incoming_settlement(
+    async fn update_balance_for_incoming_settlement(
         &self,
         account_id: Uuid,
         amount: u64,
         _idempotency_key: Option<String>,
-    ) -> Box<dyn Future<Item = (), Error = ()> + Send> {
+    ) -> Result<(), SettlementStoreError> {
         let mut accounts = self.accounts.write();
         for mut a in &mut *accounts {
             if a.id() == account_id {
                 a.balance += amount as i64;
             }
         }
-        let ret = if self.should_fail { err(()) } else { ok(()) };
-        Box::new(ret)
+        if self.should_fail {
+            Err(SettlementStoreError::BalanceUpdateFailure)
+        } else {
+            Ok(())
+        }
     }
 
-    fn refund_settlement(
+    async fn refund_settlement(
         &self,
         _account_id: Uuid,
         _settle_amount: u64,
-    ) -> Box<dyn Future<Item = (), Error = ()> + Send> {
-        let ret = if self.should_fail { err(()) } else { ok(()) };
-        Box::new(ret)
+    ) -> Result<(), SettlementStoreError> {
+        if self.should_fail {
+            Err(SettlementStoreError::RefundFailure)
+        } else {
+            Ok(())
+        }
     }
 }
 
+#[async_trait]
 impl IdempotentStore for TestStore {
-    fn load_idempotent_data(
+    async fn load_idempotent_data(
         &self,
         idempotency_key: String,
-    ) -> Box<dyn Future<Item = Option<IdempotentData>, Error = ()> + Send> {
+    ) -> Result<Option<IdempotentData>, IdempotentStoreError> {
         let cache = self.cache.read();
         if let Some(data) = cache.get(&idempotency_key) {
             let mut guard = self.cache_hits.write();
             *guard += 1; // used to test how many times this branch gets executed
-            Box::new(ok(Some(data.clone())))
+            Ok(Some(data.clone()))
         } else {
-            Box::new(ok(None))
+            Ok(None)
         }
     }
 
-    fn save_idempotent_data(
+    async fn save_idempotent_data(
         &self,
         idempotency_key: String,
         input_hash: [u8; 32],
         status_code: StatusCode,
         data: Bytes,
-    ) -> Box<dyn Future<Item = (), Error = ()> + Send> {
+    ) -> Result<(), IdempotentStoreError> {
         let mut cache = self.cache.write();
         cache.insert(
             idempotency_key,
             IdempotentData::new(status_code, data, input_hash),
         );
-        Box::new(ok(()))
+        Ok(())
     }
 }
 
+#[async_trait]
 impl AccountStore for TestStore {
     type Account = TestAccount;
 
-    fn get_accounts(
+    async fn get_accounts(
         &self,
         account_ids: Vec<Uuid>,
-    ) -> Box<dyn Future<Item = Vec<Self::Account>, Error = ()> + Send> {
+    ) -> Result<Vec<Self::Account>, AccountStoreError> {
         let accounts: Vec<TestAccount> = self
             .accounts
             .read()
@@ -166,75 +171,83 @@ impl AccountStore for TestStore {
             })
             .collect();
         if accounts.len() == account_ids.len() {
-            Box::new(ok(accounts))
+            Ok(accounts)
         } else {
-            Box::new(err(()))
+            Err(AccountStoreError::WrongLength {
+                expected: account_ids.len(),
+                actual: accounts.len(),
+            })
         }
     }
 
     // stub implementation (not used in these tests)
-    fn get_account_id_from_username(
+    async fn get_account_id_from_username(
         &self,
         _username: &Username,
-    ) -> Box<dyn Future<Item = Uuid, Error = ()> + Send> {
-        Box::new(ok(Uuid::new_v4()))
+    ) -> Result<Uuid, AccountStoreError> {
+        Ok(Uuid::new_v4())
     }
 }
 
+#[async_trait]
 impl LeftoversStore for TestStore {
     type AccountId = Uuid;
     type AssetType = BigUint;
 
-    fn save_uncredited_settlement_amount(
+    async fn save_uncredited_settlement_amount(
         &self,
         account_id: Uuid,
         uncredited_settlement_amount: (Self::AssetType, u8),
-    ) -> Box<dyn Future<Item = (), Error = ()> + Send> {
+    ) -> Result<(), LeftoversStoreError> {
         let mut guard = self.uncredited_settlement_amount.write();
         if let Some(leftovers) = (*guard).get_mut(&account_id) {
-            if leftovers.1 > uncredited_settlement_amount.1 {
-                // the current leftovers maintain the scale so we just need to
-                // upscale the provided leftovers to the existing leftovers' scale
-                let scaled = uncredited_settlement_amount
-                    .0
-                    .normalize_scale(ConvertDetails {
-                        from: uncredited_settlement_amount.1,
-                        to: leftovers.1,
-                    })
-                    .unwrap();
-                *leftovers = (leftovers.0.clone() + scaled, leftovers.1);
-            } else if leftovers.1 == uncredited_settlement_amount.1 {
-                *leftovers = (
-                    leftovers.0.clone() + uncredited_settlement_amount.0,
-                    leftovers.1,
-                );
-            } else {
-                // if the scale of the provided leftovers is bigger than
-                // existing scale then we update the scale of the leftovers'
-                // scale
-                let scaled = leftovers
-                    .0
-                    .normalize_scale(ConvertDetails {
-                        from: leftovers.1,
-                        to: uncredited_settlement_amount.1,
-                    })
-                    .unwrap();
-                *leftovers = (
-                    uncredited_settlement_amount.0 + scaled,
-                    uncredited_settlement_amount.1,
-                );
+            match leftovers.1.cmp(&uncredited_settlement_amount.1) {
+                Ordering::Greater => {
+                    // the current leftovers maintain the scale so we just need to
+                    // upscale the provided leftovers to the existing leftovers' scale
+                    let scaled = uncredited_settlement_amount
+                        .0
+                        .normalize_scale(ConvertDetails {
+                            from: uncredited_settlement_amount.1,
+                            to: leftovers.1,
+                        })
+                        .unwrap();
+                    *leftovers = (leftovers.0.clone() + scaled, leftovers.1);
+                }
+                Ordering::Equal => {
+                    *leftovers = (
+                        leftovers.0.clone() + uncredited_settlement_amount.0,
+                        leftovers.1,
+                    );
+                }
+                _ => {
+                    // if the scale of the provided leftovers is bigger than
+                    // existing scale then we update the scale of the leftovers'
+                    // scale
+                    let scaled = leftovers
+                        .0
+                        .normalize_scale(ConvertDetails {
+                            from: leftovers.1,
+                            to: uncredited_settlement_amount.1,
+                        })
+                        .unwrap();
+                    *leftovers = (
+                        uncredited_settlement_amount.0 + scaled,
+                        uncredited_settlement_amount.1,
+                    );
+                }
             }
         } else {
             (*guard).insert(account_id, uncredited_settlement_amount);
         }
-        Box::new(ok(()))
+        Ok(())
     }
 
-    fn load_uncredited_settlement_amount(
+    async fn load_uncredited_settlement_amount(
         &self,
         account_id: Uuid,
         local_scale: u8,
-    ) -> Box<dyn Future<Item = Self::AssetType, Error = ()> + Send> {
+    ) -> Result<Self::AssetType, LeftoversStoreError> {
         let mut guard = self.uncredited_settlement_amount.write();
         if let Some(l) = guard.get_mut(&account_id) {
             let ret = l.clone();
@@ -242,28 +255,28 @@ impl LeftoversStore for TestStore {
                 scale_with_precision_loss(ret.0, local_scale, ret.1);
             // save the new leftovers
             *l = (leftover_precision_loss, std::cmp::max(local_scale, ret.1));
-            Box::new(ok(scaled_leftover_amount))
+            Ok(scaled_leftover_amount)
         } else {
-            Box::new(ok(BigUint::from(0u32)))
+            Ok(BigUint::from(0u32))
         }
     }
 
-    fn get_uncredited_settlement_amount(
+    async fn get_uncredited_settlement_amount(
         &self,
         account_id: Uuid,
-    ) -> Box<dyn Future<Item = (Self::AssetType, u8), Error = ()> + Send> {
+    ) -> Result<(Self::AssetType, u8), LeftoversStoreError> {
         let leftovers = self.uncredited_settlement_amount.read();
-        Box::new(ok(if let Some(a) = leftovers.get(&account_id) {
+        Ok(if let Some(a) = leftovers.get(&account_id) {
             a.clone()
         } else {
             (BigUint::from(0u32), 1)
-        }))
+        })
     }
 
-    fn clear_uncredited_settlement_amount(
+    async fn clear_uncredited_settlement_amount(
         &self,
         _account_id: Uuid,
-    ) -> Box<dyn Future<Item = (), Error = ()> + Send> {
+    ) -> Result<(), LeftoversStoreError> {
         unreachable!()
     }
 }
@@ -304,15 +317,6 @@ impl TestAccount {
     }
 }
 
-#[allow(dead_code)]
-pub fn mock_settlement(status_code: usize) -> mockito::Mock {
-    mock("POST", SETTLEMENT_API.clone())
-        // The settlement API receives json data
-        .match_header("Content-Type", "application/json")
-        .with_status(status_code)
-        .with_body(BODY)
-}
-
 pub fn mock_message(status_code: usize) -> mockito::Mock {
     mock("POST", MESSAGES_API.clone())
         // The messages API receives raw data
@@ -321,29 +325,16 @@ pub fn mock_message(status_code: usize) -> mockito::Mock {
         .with_body(BODY)
 }
 
-// Futures helper taken from the store_helpers in interledger-store-redis.
-pub fn block_on<F>(f: F) -> Result<F::Item, F::Error>
-where
-    F: Future + Send + 'static,
-    F::Item: Send,
-    F::Error: Send,
-{
-    // Only run one test at a time
-    let _ = env_logger::try_init();
-    let mut runtime = Runtime::new().unwrap();
-    runtime.block_on(f)
-}
-
 pub fn test_service(
 ) -> SettlementMessageService<impl IncomingService<TestAccount> + Clone, TestAccount> {
     SettlementMessageService::new(incoming_service_fn(|_request| {
-        Box::new(err(RejectBuilder {
+        Err(RejectBuilder {
             code: ErrorCode::F02_UNREACHABLE,
             message: b"No other incoming handler!",
             data: &[],
             triggered_by: Some(&SERVICE_ADDRESS),
         }
-        .build()))
+        .build())
     }))
 }
 
@@ -359,21 +350,21 @@ pub fn test_api(
     should_fulfill: bool,
 ) -> warp::filters::BoxedFilter<(impl warp::Reply,)> {
     let outgoing = outgoing_service_fn(move |_| {
-        Box::new(if should_fulfill {
-            ok(FulfillBuilder {
+        if should_fulfill {
+            Ok(FulfillBuilder {
                 fulfillment: &[0; 32],
                 data: b"hello!",
             }
             .build())
         } else {
-            err(RejectBuilder {
+            Err(RejectBuilder {
                 code: ErrorCode::F02_UNREACHABLE,
                 message: b"No other outgoing handler!",
                 data: &[],
                 triggered_by: Some(&SERVICE_ADDRESS),
             }
             .build())
-        })
+        }
     });
     create_settlements_filter(test_store, outgoing)
 }

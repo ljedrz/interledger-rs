@@ -5,42 +5,47 @@
 //! This uses a simple HTTPS request to establish a shared key between the sender and receiver that is used to
 //! authenticate ILP packets sent between them. SPSP uses the STREAM transport protocol for sending money and data over ILP.
 
-use failure::Fail;
 use interledger_packet::Address;
 use interledger_stream::Error as StreamError;
 use serde::{Deserialize, Serialize};
 
+/// An SPSP client which can query an SPSP Server's payment pointer and initiate a STREAM payment
 mod client;
+/// An SPSP Server implementing an HTTP Service which generates ILP Addresses and Shared Secrets
 mod server;
 
 pub use client::{pay, query};
 pub use server::SpspResponder;
 
-// TODO should these error variants be renamed to remove the 'Error' suffix from each one?
-#[derive(Fail, Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum Error {
-    #[fail(display = "Unable to query SPSP server: {:?}", _0)]
+    #[error("Unable to query SPSP server: {0}")]
     HttpError(String),
-    #[fail(display = "Got invalid SPSP response from server: {:?}", _0)]
+    #[error("Got invalid SPSP response from server: {0}")]
     InvalidSpspServerResponseError(String),
-    #[fail(display = "STREAM error: {}", _0)]
-    StreamError(StreamError),
-    #[fail(display = "Error sending money: {}", _0)]
+    #[error("STREAM error: {0}")]
+    StreamError(#[from] StreamError),
+    #[error("Error sending money: {0}")]
     SendMoneyError(u64),
-    #[fail(display = "Error listening: {}", _0)]
+    #[error("Error listening: {0}")]
     ListenError(String),
-    #[fail(display = "Invalid Payment Pointer: {}", _0)]
+    #[error("Invalid Payment Pointer: {0}")]
     InvalidPaymentPointerError(String),
 }
 
+/// An SPSP Response returned by the SPSP server
 #[derive(Debug, Deserialize, Serialize)]
 pub struct SpspResponse {
+    /// The generated ILP Address for this SPSP connection
     destination_account: Address,
+    /// Base-64 encoded shared secret between SPSP client and server
+    /// to be consumed for the STREAM connection
     #[serde(with = "serde_base64")]
     shared_secret: Vec<u8>,
 }
 
 // From https://github.com/serde-rs/json/issues/360#issuecomment-330095360
+#[doc(hidden)]
 mod serde_base64 {
     use base64;
     use serde::{de, Deserialize, Deserializer, Serializer};
