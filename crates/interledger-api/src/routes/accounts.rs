@@ -7,12 +7,13 @@ use interledger_errors::*;
 use interledger_http::{deserialize_json, HttpAccount, HttpStore};
 use interledger_ildcp::IldcpRequest;
 use interledger_ildcp::IldcpResponse;
+use interledger_rates::ExchangeRateStore;
 use interledger_router::RouterStore;
 use interledger_service::{
     Account, AccountStore, AddressStore, IncomingService, OutgoingRequest, OutgoingService,
     Username,
 };
-use interledger_service_util::{BalanceStore, ExchangeRateStore};
+use interledger_service_util::BalanceStore;
 use interledger_settlement::core::{types::SettlementAccount, SettlementClient};
 use interledger_spsp::{pay, SpspResponder};
 use interledger_stream::{PaymentNotification, StreamNotificationsStore};
@@ -27,11 +28,20 @@ use warp::{self, reply::Json, Filter, Rejection};
 
 pub const BEARER_TOKEN_START: usize = 7;
 
+const fn get_default_max_slippage() -> f64 {
+    0.01
+}
+
 #[derive(Deserialize, Debug)]
 struct SpspPayRequest {
     receiver: String,
     #[serde(deserialize_with = "number_or_string")]
     source_amount: u64,
+    #[serde(
+        deserialize_with = "number_or_string",
+        default = "get_default_max_slippage"
+    )]
+    slippage: f64,
 }
 
 pub fn accounts_api<I, O, S, A, B>(
@@ -338,14 +348,17 @@ where
         .and(warp::path::end())
         .and(deserialize_json())
         .and(with_incoming_handler)
+        .and(with_store.clone())
         .and_then(
-            move |account: A, pay_request: SpspPayRequest, incoming_handler: I| {
+            move |account: A, pay_request: SpspPayRequest, incoming_handler: I, store: S| {
                 async move {
                     let receipt = pay(
                         incoming_handler,
                         account.clone(),
+                        store,
                         &pay_request.receiver,
                         pay_request.source_amount,
+                        pay_request.slippage,
                     )
                     .map_err(|err| {
                         let msg = format!("Error sending SPSP payment: {}", err);
