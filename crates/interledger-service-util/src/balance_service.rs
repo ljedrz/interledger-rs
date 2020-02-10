@@ -101,7 +101,6 @@ where
         let from_id = from.id();
         let to = request.to.clone();
         let to_clone = to.clone();
-        let to_id = to.id();
         let incoming_amount = request.original_amount;
         let outgoing_amount = request.prepare.amount();
         let ilp_address = self.store.get_ilp_address();
@@ -118,7 +117,7 @@ where
         // operate as-if the settlement engine has completed. Finally, if the request to the settlement-engine
         // fails, this amount will be re-added back to balance.
         self.store
-            .update_balances_for_prepare(from.id(), incoming_amount)
+            .update_balances_for_prepare(from_id, incoming_amount)
             .map_err(move |_| {
                 debug!("Rejecting packet because it would exceed a balance limit");
                 RejectBuilder {
@@ -141,46 +140,8 @@ where
                     // we need to propagate it backwards ASAP. If we do not give the
                     // previous node the fulfillment in time, they won't pay us back
                     // for the packet we forwarded. Note this means that we will
-                    // relay the fulfillment _even if saving to the DB fails._
-                    tokio::spawn(async move {
-                        let (balance, amount_to_settle) = store
-                            .update_balances_for_fulfill(to.id(), outgoing_amount)
-                            .map_err(|err| error!("Error applying balance changes for fulfill from account: {} to account: {}. Incoming amount was: {}, outgoing amount was: {}. Error: {}", from_id, to_id, incoming_amount, outgoing_amount, err))
-                            .await?;
-                        debug!(
-                            "Account balance after fulfill: {}. Amount that needs to be settled: {}",
-                            balance, amount_to_settle
-                        );
-                        if amount_to_settle > 0 {
-                            if let Some(engine_details) = to.settlement_engine_details() {
-                                let engine_url = engine_details.url;
-                                // Note that if this program crashes after changing the balance (in the PROCESS_FULFILL script)
-                                // and the send_settlement fails but the program isn't alive to hear that, the balance will be incorrect.
-                                // No other instance will know that it was trying to send an outgoing settlement. We could
-                                // make this more robust by saving something to the DB about the outgoing settlement when we change the balance
-                                // but then we would also need to prevent a situation where every connector instance is polling the
-                                // settlement engine for the status of each
-                                // outgoing settlement and putting unnecessary
-                                // load on the settlement engine.
-                                if settlement_client
-                                    .send_settlement(
-                                        to.id(),
-                                        engine_url,
-                                        amount_to_settle,
-                                        to.asset_scale(),
-                                    )
-                                    .await
-                                    .is_err()
-                                {
-                                    store
-                                        .refund_settlement(to_id, amount_to_settle)
-                                        .map_err(|_| ())
-                                        .await?;
-                                }
-                            }
-                        }
-                        Ok::<(), ()>(())
-                    });
+                    // relay the fulfillment _even if saving to the DB fails.
+                    settle_or_rollback_later(incoming_amount, outgoing_amount, store, from_id, to, settlement_client);
                 }
 
                 Ok(fulfill)
@@ -209,6 +170,61 @@ where
             }
         }
     }
+}
+
+fn settle_or_rollback_later<A>(incoming_amount: u64, outgoing_amount: u64, store: impl BalanceStore + SettlementStore + Send + Sync + 'static, from_id: Uuid, to: A, settlement_client: SettlementClient)
+    where A: SettlementAccount + Send + Sync + 'static
+{
+    tokio::spawn(settle_or_rollback_now(incoming_amount, outgoing_amount, store, from_id, to, settlement_client));
+}
+
+async fn settle_or_rollback_now<A>(incoming_amount: u64, outgoing_amount: u64, store: impl BalanceStore + SettlementStore + Send + Sync + 'static, from_id: Uuid, to: A, settlement_client: SettlementClient) -> Result<(), ()>
+    where A: SettlementAccount + Send + Sync + 'static
+{
+    let (balance, amount_to_settle) = store
+        .update_balances_for_fulfill(to.id(), outgoing_amount)
+        .map_err(|err| error!("Error applying balance changes for fulfill from account: {} to account: {}. Incoming amount was: {}, outgoing amount was: {}. Error: {}", from_id, to.id(), incoming_amount, outgoing_amount, err))
+        .await?;
+
+    // this message is really important, if you want to recover the balance after a crash; all of
+    // the "amount that need to be settled" must be summed and added to accounts "balance".
+    debug!(
+        "Account balance after fulfill: {}. Amount that needs to be settled: {}",
+        balance, amount_to_settle
+    );
+
+    if amount_to_settle == 0 {
+        return Ok(());
+    }
+
+    if let Some(engine_details) = to.settlement_engine_details() {
+        let engine_url = engine_details.url;
+        // Note that if this program crashes after changing the balance (in the PROCESS_FULFILL script)
+        // and the send_settlement fails but the program isn't alive to hear that, the balance will be incorrect.
+        // No other instance will know that it was trying to send an outgoing settlement. We could
+        // make this more robust by saving something to the DB about the outgoing settlement when we change the balance
+        // but then we would also need to prevent a situation where every connector instance is polling the
+        // settlement engine for the status of each
+        // outgoing settlement and putting unnecessary
+        // load on the settlement engine.
+        if settlement_client
+            .send_settlement(
+                to.id(),
+                engine_url,
+                amount_to_settle,
+                to.asset_scale(),
+            )
+            .await
+            .is_err()
+        {
+            store
+                .refund_settlement(to.id(), amount_to_settle)
+                .map_err(|_| ())
+                .await?;
+        }
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]
