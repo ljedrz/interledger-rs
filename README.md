@@ -34,7 +34,7 @@ To run the Interledger.rs components by themselves (rather than the `testnet-bun
 #### Install
 
 ```bash #
-docker pull interledgerrs/node
+docker pull interledgerrs/ilp-node
 docker pull interledgerrs/ilp-cli
 docker pull interledgerrs/ilp-settlement-ethereum
 ```
