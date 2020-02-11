@@ -224,6 +224,8 @@ async fn settle_or_rollback_now<Acct, Store>(
 
     if amount_to_settle == 0 {
         // so we might have some balance, but it's not over the threshold
+        // this might still end up scheduling a no-op as we should really be comparing to
+        // `settle_to` which we do not have access here.
         if balance > 0 {
             // so if we have the timeout configured, we should now make sure that there is a
             // timeout pending or new one is created right now.
@@ -249,6 +251,11 @@ async fn settle_or_rollback<Store, Acct>(store: Store, to: Acct, amount: u64, cl
     where Store: SettlementStore<Account = Acct> + 'static,
           Acct: SettlementAccount + 'static,
 {
+    if amount == 0 {
+        debug!("Nothing to settle for account {}", to.id());
+        return Ok(());
+    }
+
     if let Some(engine_details) = to.settlement_engine_details() {
         let engine_url = engine_details.url;
         // Note that if this program crashes after changing the balance (in the PROCESS_FULFILL script)
@@ -281,6 +288,9 @@ async fn settle_or_rollback<Store, Acct>(store: Store, to: Acct, amount: u64, cl
                         to.id(), amount, e))
                 .await?;
         }
+    } else {
+        debug!("Settlement for account {} for {} failed as the account has no settlement-engine details",
+            to.id(), amount);
     }
 
     Ok(())
@@ -426,7 +436,7 @@ async fn run_timeouts_and_settle_on_delay<St, Store, Acct>(delay: Duration, mut 
                                 .map_err(|e| warn!("Time based settlement failed for {}: {}", id, e))?;
 
                             debug!(
-                                "Account {} balance on fulfill: {}, Amount that needs to be settled: {}",
+                                "Account {} balance at time based settlement: {}, Amount that needs to be settled: {}",
                                 to.id(), balance, amount_to_settle
                             );
 
