@@ -246,7 +246,7 @@ async fn settle_or_rollback_now<Acct, Store>(
 }
 
 async fn settle_or_rollback<Store, Acct>(store: Store, to: Acct, amount: u64, client: SettlementClient) -> Result<(), ()>
-    where Store: BalanceStore + SettlementStore<Account = Acct> + 'static,
+    where Store: SettlementStore<Account = Acct> + 'static,
           Acct: SettlementAccount + 'static,
 {
     if let Some(engine_details) = to.settlement_engine_details() {
