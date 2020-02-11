@@ -480,7 +480,7 @@ mod tests {
             .build())
         });
         let store = TestStore::new(1);
-        let mut service = BalanceService::new(store.clone(), next);
+        let mut service = BalanceService::new(store.clone(), None, next);
         let fulfill = service.send_request(TEST_REQUEST.clone()).await.unwrap();
         assert_eq!(fulfill.data(), b"test data");
 
@@ -503,7 +503,7 @@ mod tests {
             .build())
         });
         let store = TestStore::new(0);
-        let mut service = BalanceService::new(store.clone(), next);
+        let mut service = BalanceService::new(store.clone(), None, next);
         let fulfill = service.send_request(TEST_REQUEST.clone()).await.unwrap();
         assert_eq!(fulfill.data(), b"test data");
 
@@ -526,7 +526,7 @@ mod tests {
             .build())
         });
         let store = TestStore::new(1);
-        let mut service = BalanceService::new(store.clone(), next);
+        let mut service = BalanceService::new(store.clone(), None, next);
         let fulfill = service.send_request(TEST_REQUEST.clone()).await.unwrap();
         assert_eq!(fulfill.data(), b"test data");
 
@@ -551,7 +551,7 @@ mod tests {
             .build())
         });
         let store = TestStore::new(1);
-        let mut service = BalanceService::new(store.clone(), next);
+        let mut service = BalanceService::new(store.clone(), None, next);
         let reject = service
             .send_request(TEST_REQUEST.clone())
             .await
@@ -664,6 +664,13 @@ mod tests {
         ) -> Result<(), BalanceStoreError> {
             *self.rejected_message.write() = true;
             Ok(())
+        }
+
+        async fn update_balances_for_delayed_settlement(
+            &self,
+            _: Uuid
+        ) -> Result<(i64, u64), BalanceStoreError> {
+            Ok((0, self.amount_to_settle))
         }
     }
 
