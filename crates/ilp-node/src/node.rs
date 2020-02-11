@@ -170,6 +170,28 @@ impl ExchangeRateConfig {
     }
 }
 
+/// Configuration for settlement strategy or policy.
+#[derive(Deserialize, Clone)]
+#[cfg(feature = "balance-tracking")]
+pub enum SettlementPolicyConfiguration {
+    /// Settle the account as soon as the balance goes over `settle_threshold` to the amount of
+    /// `settle_to`, this is the default unless specified.
+    ThresholdOnly,
+    /// Settle the account at minimum every delay after last fulfill. The balance is still settled
+    /// once it reaches over the `settle_threshold` but the delay will take care of any balance
+    /// staying between `settle_to` and `settle_threshold` for at least `delay` time.
+    TimeBased {
+        delay: Duration,
+    }
+}
+
+#[cfg(feature = "balance-tracking")]
+impl std::default::Default for SettlementPolicyConfiguration {
+    fn default() -> Self {
+        SettlementPolicyConfiguration::AsSoonAsPossible
+    }
+}
+
 /// An all-in-one Interledger node that includes sender and receiver functionality,
 /// a connector, and a management API.
 /// Will connect to the database at the given URL; see the crate features defined in

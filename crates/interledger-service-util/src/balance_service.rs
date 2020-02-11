@@ -1,3 +1,4 @@
+use std::time::Duration;
 use async_trait::async_trait;
 use futures::TryFutureExt;
 use interledger_errors::BalanceStoreError;
@@ -7,7 +8,7 @@ use interledger_settlement::core::{
     types::{SettlementAccount, SettlementStore},
     SettlementClient,
 };
-use log::{debug, error};
+use log::{debug, error, warn};
 use std::marker::PhantomData;
 use uuid::Uuid;
 
@@ -39,7 +40,29 @@ pub trait BalanceStore {
         from_account_id: Uuid,
         incoming_amount: u64,
     ) -> Result<(), BalanceStoreError>;
+
+    async fn update_balances_for_delayed_settling(
+        &self,
+        to_account_id: Uuid
+    ) -> Result<(i64, u64), BalanceStoreError>;
 }
+
+/// Settlement policy configured at service level.
+enum Policy {
+    AsSoonAsPossible,
+    TimeBased {
+        delay: Duration,
+    }
+}
+
+impl std::default::Default for Policy {
+    fn default() -> Self {
+        Policy::AsSoonAsPossible
+    }
+}
+
+
+
 
 /// # Balance Service
 ///
@@ -91,6 +114,7 @@ where
         // prepare.amount is 0, because the original amount could be rounded down
         // to 0 when exchange rate and scale change are applied.
         if request.prepare.amount() == 0 && request.original_amount == 0 {
+            // wonder if timeout should still be set here?
             return self.next.send_request(request).await;
         }
 
@@ -141,7 +165,13 @@ where
                     // previous node the fulfillment in time, they won't pay us back
                     // for the packet we forwarded. Note this means that we will
                     // relay the fulfillment _even if saving to the DB fails.
-                    settle_or_rollback_later(incoming_amount, outgoing_amount, store, from_id, to, settlement_client);
+                    settle_or_rollback_later(
+                        incoming_amount,
+                        outgoing_amount,
+                        store,
+                        from_id,
+                        to,
+                        settlement_client);
                 }
 
                 Ok(fulfill)
@@ -172,14 +202,24 @@ where
     }
 }
 
-fn settle_or_rollback_later<A>(incoming_amount: u64, outgoing_amount: u64, store: impl BalanceStore + SettlementStore + Send + Sync + 'static, from_id: Uuid, to: A, settlement_client: SettlementClient)
-    where A: SettlementAccount + Send + Sync + 'static
+fn settle_or_rollback_later<Acct, Store>(incoming_amount: u64, outgoing_amount: u64, store: Store, from_id: Uuid, to: Acct, settlement_client: SettlementClient)
+    where Acct: SettlementAccount + Send + Sync + 'static,
+          Store: BalanceStore + SettlementStore<Account = Acct> + Send + Sync + 'static,
 {
-    tokio::spawn(settle_or_rollback_now(incoming_amount, outgoing_amount, store, from_id, to, settlement_client));
+    tokio::spawn(settle_or_rollback_now(incoming_amount, outgoing_amount, store, from_id, to, settlement_client, ()));
 }
 
-async fn settle_or_rollback_now<A>(incoming_amount: u64, outgoing_amount: u64, store: impl BalanceStore + SettlementStore + Send + Sync + 'static, from_id: Uuid, to: A, settlement_client: SettlementClient) -> Result<(), ()>
-    where A: SettlementAccount + Send + Sync + 'static
+async fn settle_or_rollback_now<Acct, Store, Timing>(
+    incoming_amount: u64,
+    outgoing_amount: u64,
+    store: Store,
+    from_id: Uuid,
+    to: <Store as SettlementStore>::Account,
+    settlement_client: SettlementClient,
+    timing: Timing) -> Result<(), ()>
+    where Acct: SettlementAccount + Send + Sync + 'static,
+          Store: BalanceStore + SettlementStore<Account = Acct> + Send + Sync + 'static,
+          Timing: SettlementTimeouts + Send + Sync + 'static,
 {
     let (balance, amount_to_settle) = store
         .update_balances_for_fulfill(to.id(), outgoing_amount)
@@ -189,14 +229,37 @@ async fn settle_or_rollback_now<A>(incoming_amount: u64, outgoing_amount: u64, s
     // this message is really important, if you want to recover the balance after a crash; all of
     // the "amount that need to be settled" must be summed and added to accounts "balance".
     debug!(
-        "Account balance after fulfill: {}. Amount that needs to be settled: {}",
-        balance, amount_to_settle
+        "Account {} balance after fulfill: {}. Amount that needs to be settled: {}",
+        to.id(), balance, amount_to_settle
     );
 
     if amount_to_settle == 0 {
+        // so we might have some balance, but it's not over the threshold
+        if balance > 0 {
+            // so if we have the timeout configured, we should now make sure that there is a
+            // timeout pending or new one is created right now.
+            //
+            // two different approaches:
+            //  - some Arc<Mutex<Something>>
+            //  - some channel of Account ids
+            //
+            // the new settlement thing will need to settle any balance x to settle_to,
+            // where x >= settle_to
+            timing.settle_later(to.id());
+        }
         return Ok(());
     }
 
+    // FIXME: maybe cancel any timeout here?
+    timing.clear_later(to.id());
+
+    settle(store, to, amount_to_settle, settlement_client).await
+}
+
+async fn settle<Store, Acct>(store: Store, to: Acct, amount: u64, client: SettlementClient) -> Result<(), ()>
+    where Store: BalanceStore + SettlementStore<Account = Acct> + 'static,
+          Acct: SettlementAccount + 'static,
+{
     if let Some(engine_details) = to.settlement_engine_details() {
         let engine_url = engine_details.url;
         // Note that if this program crashes after changing the balance (in the PROCESS_FULFILL script)
@@ -207,24 +270,184 @@ async fn settle_or_rollback_now<A>(incoming_amount: u64, outgoing_amount: u64, s
         // settlement engine for the status of each
         // outgoing settlement and putting unnecessary
         // load on the settlement engine.
-        if settlement_client
+
+        let result = client
             .send_settlement(
                 to.id(),
                 engine_url,
-                amount_to_settle,
+                amount,
                 to.asset_scale(),
             )
-            .await
-            .is_err()
+            .await;
+
+        if let Err(client_error) = result
         {
+            warn!("Settlement for account {} for {} failed: {}",
+                to.id(), amount, client_error);
+
             store
-                .refund_settlement(to.id(), amount_to_settle)
-                .map_err(|_| ())
+                .refund_settlement(to.id(), amount)
+                .map_err(|e| error!(
+                        "Refunding account {} after failed settlement failed, amount: {}: {}",
+                        to.id(), amount, e))
                 .await?;
         }
     }
 
     Ok(())
+}
+
+trait SettlementTimeouts {
+    /// Called to clear a pending timeout, if there's any
+    fn clear_later(&self, account_id: Uuid);
+    /// Called to signal this account id needs to be settled later
+    fn settle_later(&self, account_id: Uuid);
+}
+
+impl SettlementTimeouts for () {
+    fn clear_later(&self, _: Uuid) { todo!() }
+    fn settle_later(&self, _: Uuid) { todo!() }
+}
+
+enum ManageTimeout {
+    Clear(Uuid),
+    Set(Uuid),
+}
+
+impl SettlementTimeouts for tokio::sync::mpsc::UnboundedSender<ManageTimeout> {
+    fn clear_later(&self, account_id: Uuid) {
+        let _ = self.send(ManageTimeout::Clear(account_id));
+        // FIXME: not sure what do with an error, like it's a quite bad situation
+    }
+
+    fn settle_later(&self, account_id: Uuid) {
+        let _ = self.send(ManageTimeout::Set(account_id));
+        // FIXME: error again
+    }
+}
+
+#[derive(Debug)]
+enum ExitReason {
+    Shutdown,
+    Capacity,
+    Other(tokio::time::Error),
+}
+
+use std::fmt;
+
+impl fmt::Display for ExitReason {
+    fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
+        use ExitReason::*;
+        match *self {
+            Shutdown => write!(fmt, "Tokio is shutting down"),
+            Capacity => write!(fmt, "Timer service is over capacity"),
+            Other(ref e) => write!(fmt, "Other: {}", e),
+        }
+    }
+}
+
+async fn run_timeouts_and_settle_on_delay<St, Store, Acct>(delay: Duration, cmds: St, store: Store) -> ExitReason
+    where St: tokio::stream::Stream<Item = ManageTimeout> + Unpin,
+          Store: BalanceStore + SettlementStore<Account = Acct> + AccountStore<Account = Acct> + Clone + Send + Sync + 'static,
+          Acct: SettlementAccount + Send + Sync + 'static,
+{
+    use std::collections::HashMap;
+    use tokio::time::DelayQueue;
+    use tokio::stream::StreamExt;
+
+    let client: SettlementClient = todo!();
+    let store: Store = todo!();
+    let mut cmds = cmds.fuse();
+    let mut timeouts = DelayQueue::new();
+    let mut in_queue = HashMap::new();
+
+    let mut input_closed = false;
+
+    loop {
+        tokio::select! {
+            cmd = cmds.next() => {
+                match cmd {
+                    Some(ManageTimeout::Clear(id)) => {
+                        let key = in_queue.remove(&id);
+
+                        if let Some(key) = key {
+                            timeouts.remove(&key);
+                        }
+                    }
+                    Some(ManageTimeout::Set(id)) => {
+                        let in_queue = &mut in_queue;
+                        in_queue.entry(id.clone()).or_insert_with(move || timeouts.insert(id, delay));
+                    }
+                    None => {
+                        input_closed = true;
+                    }
+                }
+            },
+            next = timeouts.next() => {
+                match next {
+                    Some(Ok(expired)) => {
+                        let id = expired.into_inner();
+                        in_queue.remove(&id); // unsure if this can ever be none
+
+                        let client = client.clone();
+                        let store = store.clone();
+
+                        // FIXME: spawn to update database and notify the engine
+                        //  * how to load an account by id
+                        //  * need a clone of SettlementClient, probably with an argument
+                        tokio::spawn(async move {
+                            // TODO: this operation must be implemented elsewhere as well
+                            let to = match store.get_accounts(vec![id.clone()]).await {
+                                Ok(mut accounts) if accounts.len() == 1 => {
+                                    accounts.pop().unwrap()
+                                },
+                                Ok(accounts) => {
+                                    error!(
+                                        "Asked for account {} for delayed settlement got back {} accounts: {:?}",
+                                        id, accounts.len(), accounts
+                                    );
+                                    return Ok(());
+                                }
+                                Err(e) => {
+                                    warn!(
+                                        "Failed to load account {} for time based settlement: {}",
+                                        id, e
+                                    );
+                                    return Err(());
+                                }
+                            };
+
+                            let (balance, amount_to_settle) = store.update_balances_for_delayed_settling(id.clone()).await
+                                .map_err(|e| warn!("Time based settlement failed for {}: {}", id, e))?;
+
+                            debug!(
+                                "Account {} balance on fulfill: {}, Amount that needs to be settled: {}",
+                                to.id(), balance, amount_to_settle
+                            );
+
+                            settle(store, to, amount_to_settle, client).await
+
+                            // store.update_balance_on_timed_settling() -> Result<amount_to_settle>
+                        });
+                    },
+                    Some(Err(e)) if e.is_shutdown() => {
+                        // we probably cant do much better than to exit here (and to drop the
+                        // stream)
+                        return ExitReason::Shutdown;
+                    },
+                    Some(Err(e)) if e.is_at_capacity() => {
+                        return ExitReason::Capacity;
+                    },
+                    Some(Err(e)) => {
+                        return ExitReason::Other(e);
+                    }
+                    None => {
+                        // no more timeouts currently
+                    }
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
