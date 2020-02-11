@@ -204,7 +204,7 @@ async fn settle_or_rollback_now<Acct, Store>(
     outgoing_amount: u64,
     store: Store,
     from_id: Uuid,
-    to: <Store as SettlementStore>::Account,
+    to: Acct,
     settlement_client: SettlementClient,
     policy: Policy) -> Result<(), ()>
     where Acct: SettlementAccount + Send + Sync + 'static,
