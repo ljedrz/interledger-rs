@@ -5,8 +5,8 @@ use interledger_packet::{
     oer::{BufOerExt, MutBufOerExt},
     Address, Fulfill, FulfillBuilder, ParseError, Prepare, PrepareBuilder,
 };
-use lazy_static::lazy_static;
 use log::error;
+use once_cell::sync::Lazy;
 use std::{
     convert::TryFrom,
     fmt::{self, Debug},
@@ -26,18 +26,21 @@ const FLAG_TRANSITIVE: u8 = 0x40;
 const FLAG_PARTIAL: u8 = 0x20;
 const FLAG_UTF8: u8 = 0x10;
 
-lazy_static! {
-    pub static ref CCP_RESPONSE: Fulfill = FulfillBuilder {
+pub static CCP_RESPONSE: Lazy<Fulfill> = Lazy::new(|| {
+    FulfillBuilder {
         fulfillment: &PEER_PROTOCOL_FULFILLMENT,
         data: &[],
     }
-    .build();
-    pub static ref CCP_CONTROL_DESTINATION: Address =
-        Address::from_str("peer.route.control").unwrap();
-    pub static ref CCP_UPDATE_DESTINATION: Address =
-        Address::from_str("peer.route.update").unwrap();
-}
+    .build()
+});
+pub static CCP_CONTROL_DESTINATION: Lazy<Address> =
+    Lazy::new(|| Address::from_str("peer.route.control").unwrap());
+pub static CCP_UPDATE_DESTINATION: Lazy<Address> =
+    Lazy::new(|| Address::from_str("peer.route.update").unwrap());
 
+/// CCP Packet mode used in Route Control Requests of the CCP protocol.
+/// Idle: Account does not wish to receive more routes
+/// Sync: Account wishes to receive routes
 #[derive(Clone, Copy, PartialEq, Debug)]
 #[repr(u8)]
 pub enum Mode {
@@ -60,6 +63,9 @@ impl TryFrom<u8> for Mode {
     }
 }
 
+/// A request that ask the receiver node to transition to Idle or Sync mode.
+/// If the mode is Idle, the receiver of the request will stop broadcasting routes to the sender.
+/// If the mode is Sync, the receiver will start broadcasting routes to that account.
 #[derive(Clone, PartialEq)]
 pub struct RouteControlRequest {
     pub mode: Mode,
@@ -153,8 +159,14 @@ impl RouteControlRequest {
     }
 }
 
+impl From<RouteControlRequest> for Prepare {
+    fn from(request: RouteControlRequest) -> Self {
+        request.to_prepare()
+    }
+}
+
 #[derive(Clone, PartialEq, Debug)]
-pub struct RouteProp {
+pub(crate) struct RouteProp {
     pub(crate) is_optional: bool,
     pub(crate) is_transitive: bool,
     pub(crate) is_partial: bool,
@@ -215,7 +227,7 @@ impl RouteProp {
 }
 
 #[derive(Clone, PartialEq)]
-pub struct Route {
+pub(crate) struct Route {
     // TODO switch this to use the Address type so we don't need separate parsing logic when implementing Debug
     pub(crate) prefix: String,
     pub(crate) path: Vec<String>,
@@ -401,6 +413,12 @@ impl RouteUpdateRequest {
     }
 }
 
+impl From<RouteUpdateRequest> for Prepare {
+    fn from(request: RouteUpdateRequest) -> Self {
+        request.to_prepare()
+    }
+}
+
 #[cfg(test)]
 mod route_control_request {
     use super::*;
@@ -430,7 +448,7 @@ mod route_control_request {
         assert!(result.is_err());
         assert_eq!(
             result.unwrap_err().to_string(),
-            "Invalid Packet Packet is not a CCP message. Destination: peer.route.controk"
+            "Invalid Packet: Packet is not a CCP message. Destination: peer.route.controk"
         );
     }
 
@@ -441,7 +459,7 @@ mod route_control_request {
         assert!(result.is_err());
         assert_eq!(
             result.unwrap_err().to_string(),
-            "Invalid Packet Wrong condition: 66687aadf862bd776c8fc18b8e9f8e21089714856ee233b3902a591d0d5f2925"
+            "Invalid Packet: Wrong condition: 66687aadf862bd776c8fc18b8e9f8e21089714856ee233b3902a591d0d5f2925"
         );
     }
 
@@ -452,7 +470,7 @@ mod route_control_request {
         assert!(result.is_err());
         assert_eq!(
             result.unwrap_err().to_string(),
-            "Invalid Packet Packet expired"
+            "Invalid Packet: Packet expired"
         );
     }
 }
@@ -502,7 +520,7 @@ mod route_update_request {
         assert!(result.is_err());
         assert_eq!(
             result.unwrap_err().to_string(),
-            "Invalid Packet Packet is not a CCP message. Destination: peer.route.updatd"
+            "Invalid Packet: Packet is not a CCP message. Destination: peer.route.updatd"
         );
     }
 
@@ -511,7 +529,7 @@ mod route_update_request {
         let prepare = Prepare::try_from(BytesMut::from(hex::decode("0c7e0000000000000000323031353036313630303031303030303066687aadf862bd776c8fd18b8e9f8e20089714856ee233b3902a591d0d5f292511706565722e726f7574652e7570646174653221e55f8eabcd4e979ab9bf0ff00a224c000000340000003400000034000075300d6578616d706c652e616c69636501000100").unwrap())).unwrap();
         let result = RouteUpdateRequest::try_from_without_expiry(&prepare);
         assert!(result.is_err());
-        assert_eq!(result.unwrap_err().to_string(), "Invalid Packet Wrong condition: 66687aadf862bd776c8fd18b8e9f8e20089714856ee233b3902a591d0d5f2925");
+        assert_eq!(result.unwrap_err().to_string(), "Invalid Packet: Wrong condition: 66687aadf862bd776c8fd18b8e9f8e20089714856ee233b3902a591d0d5f2925");
     }
 
     #[test]
@@ -521,7 +539,7 @@ mod route_update_request {
         assert!(result.is_err());
         assert_eq!(
             result.unwrap_err().to_string(),
-            "Invalid Packet Packet expired"
+            "Invalid Packet: Packet expired"
         );
     }
 

@@ -4,7 +4,7 @@ use interledger_packet::{
     oer::{predict_var_octet_string, BufOerExt, MutBufOerExt},
     Address, Fulfill, FulfillBuilder, ParseError, Prepare, PrepareBuilder,
 };
-use lazy_static::lazy_static;
+use once_cell::sync::Lazy;
 use std::{
     convert::TryFrom,
     fmt, str,
@@ -19,16 +19,17 @@ static PEER_PROTOCOL_CONDITION: [u8; 32] = [
 ];
 const ASSET_SCALE_LEN: usize = 1;
 
-lazy_static! {
-    static ref PEER_PROTOCOL_EXPIRY_DURATION: Duration = Duration::from_secs(60);
-    static ref ILDCP_DESTINATION: Address = Address::from_str("peer.config").unwrap();
-}
+static PEER_PROTOCOL_EXPIRY_DURATION: Lazy<Duration> = Lazy::new(|| Duration::from_secs(60));
+static ILDCP_DESTINATION: Lazy<Address> = Lazy::new(|| Address::from_str("peer.config").unwrap());
 
 pub fn is_ildcp_request(prepare: &Prepare) -> bool {
     prepare.execution_condition() == PEER_PROTOCOL_CONDITION
         && prepare.destination() == *ILDCP_DESTINATION
 }
 
+/// ILDCP Requests are sent to peers to receive an ILDCP Response
+/// which contains details about how the peer has configured our account
+/// (this is just a newtype to type-safe serialize to a Prepare packet)
 #[derive(Debug, Default)]
 pub struct IldcpRequest {}
 
@@ -55,11 +56,16 @@ impl From<IldcpRequest> for Prepare {
     }
 }
 
+/// The response to an ILDCP Request.
 #[derive(Clone, PartialEq)]
 pub struct IldcpResponse {
+    /// Serialized buffer of the response
     buffer: Bytes,
+    /// The asset scale corresponding to the requested account
     asset_scale: u8,
+    /// The offset after which the asset code is stored in the buffer
     asset_code_offset: usize,
+    /// The ILP Address we have assigned to the requested account
     ilp_address: Address,
 }
 

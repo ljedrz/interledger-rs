@@ -11,6 +11,11 @@ pub mod packet {
     pub use interledger_packet::*;
 }
 
+/// Error types used with the Interledger.rs components.
+pub mod errors {
+    pub use interledger_errors::*;
+}
+
 /// HTTP API for interacting with the Interledger.rs components.
 #[cfg(feature = "api")]
 pub mod api {
@@ -69,6 +74,16 @@ pub mod ildcp {
     //!
     //! This is used by clients to query for their ILP address and asset details such as asset code and scale.
     pub use interledger_ildcp::*;
+}
+
+/// Backend for fetching and caching exchange rates from external APIs
+#[cfg(feature = "rates")]
+pub mod rates {
+    //! # interledger-rates
+    //!
+    //! Utilities for fetching and caching exchange rates from external APIs,
+    //! which supports CoinCap and CryptoCompare rate backends.
+    pub use interledger_rates::*;
 }
 
 /// Router that determines the outgoing Account for a request based on the routing table

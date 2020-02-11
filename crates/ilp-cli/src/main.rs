@@ -23,26 +23,28 @@ pub fn main() {
             eprintln!("ilp-cli error: {}", e);
             exit(1);
         }
-        Ok(mut response) => match response.text() {
-            Err(e) => {
-                eprintln!("ilp-cli error: Failed to parse HTTP response: {}", e);
-                exit(1);
-            }
-            Ok(body) => {
-                if response.status().is_success() {
-                    if !matches.is_present("quiet") {
-                        println!("{}", body);
-                    }
-                } else {
-                    eprintln!(
-                        "ilp-cli error: Unexpected response from server: {}: {}",
-                        response.status(),
-                        body,
-                    );
+        Ok(response) => {
+            let status = response.status();
+            match response.text() {
+                Err(e) => {
+                    eprintln!("ilp-cli error: Failed to parse HTTP response: {}", e);
                     exit(1);
                 }
+                Ok(body) => {
+                    if status.is_success() {
+                        if !matches.is_present("quiet") {
+                            println!("{}", body);
+                        }
+                    } else {
+                        eprintln!(
+                            "ilp-cli error: Unexpected response from server: {}: {}",
+                            status, body,
+                        );
+                        exit(1);
+                    }
+                }
             }
-        },
+        }
     }
 }
 
@@ -90,6 +92,14 @@ mod interface_tests {
     fn accounts_delete() {
         should_parse(&[
             "ilp-cli accounts delete alice --auth foo", // minimal
+        ]);
+    }
+
+    #[test]
+    fn adjust_logs() {
+        should_parse(&[
+            "ilp-cli logs interledger=debug --auth foo", // minimal
+            "ilp-cli logs 'interledger_store=debug,interledger_ccp=trace' --auth foo", // adjust multiple crates separately
         ]);
     }
 
