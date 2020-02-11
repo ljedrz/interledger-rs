@@ -383,7 +383,7 @@ async fn run_timeouts_and_settle_on_delay<St, Store, Acct>(delay: Duration, mut 
                     }
                     Some(ManageTimeout::Set(id)) => {
                         let timeouts = &mut timeouts;
-                        in_queue.entry(id.clone()).or_insert_with(move || timeouts.insert(id, delay));
+                        in_queue.entry(id).or_insert_with(move || timeouts.insert(id, delay));
                     }
                     None => {
                         input_closed = true;
@@ -400,8 +400,9 @@ async fn run_timeouts_and_settle_on_delay<St, Store, Acct>(delay: Duration, mut 
                         let store = store.clone();
 
                         tokio::spawn(async move {
-                            // TODO: this operation must be implemented elsewhere as well
-                            let to = match store.get_accounts(vec![id.clone()]).await {
+                            // TODO: this operation sounds like it ought to be implemented
+                            // elsewhere as well, couldn't find
+                            let to = match store.get_accounts(vec![id]).await {
                                 Ok(mut accounts) if accounts.len() == 1 => {
                                     accounts.pop().unwrap()
                                 },
@@ -421,7 +422,7 @@ async fn run_timeouts_and_settle_on_delay<St, Store, Acct>(delay: Duration, mut 
                                 }
                             };
 
-                            let (balance, amount_to_settle) = store.update_balances_for_delayed_settlement(id.clone()).await
+                            let (balance, amount_to_settle) = store.update_balances_for_delayed_settlement(id).await
                                 .map_err(|e| warn!("Time based settlement failed for {}: {}", id, e))?;
 
                             debug!(
