@@ -8,7 +8,7 @@ use interledger_settlement::core::{
     types::{SettlementAccount, SettlementStore},
     SettlementClient,
 };
-use log::{debug, error, warn};
+use log::{debug, info, warn, error};
 use std::marker::PhantomData;
 use uuid::Uuid;
 
@@ -47,20 +47,6 @@ pub trait BalanceStore {
     ) -> Result<(i64, u64), BalanceStoreError>;
 }
 
-/// Settlement policy configured at service level.
-enum Policy {
-    AsSoonAsPossible,
-    TimeBased {
-        delay: Duration,
-    }
-}
-
-impl std::default::Default for Policy {
-    fn default() -> Self {
-        Policy::AsSoonAsPossible
-    }
-}
-
 /// # Balance Service
 ///
 /// Responsible for managing the balances of the account and the interaction with the Settlement Engine
@@ -71,6 +57,7 @@ pub struct BalanceService<S, O, A> {
     store: S,
     next: O,
     settlement_client: SettlementClient,
+    policy: Policy,
     account_type: PhantomData<A>,
 }
 
@@ -80,11 +67,15 @@ where
     O: OutgoingService<A>,
     A: Account + SettlementAccount,
 {
-    pub fn new(store: S, next: O) -> Self {
+    pub fn new(store: S, sender: Option<tokio::sync::mpsc::UnboundedSender<ManageTimeout>>, next: O) -> Self {
         BalanceService {
             store,
             next,
             settlement_client: SettlementClient::default(),
+            policy: match sender {
+                Some(tx) => Policy::TimeBased(tx),
+                None => Policy::ThresholdOnly,
+            },
             account_type: PhantomData,
         }
     }
@@ -168,7 +159,8 @@ where
                         store,
                         from_id,
                         to,
-                        settlement_client);
+                        settlement_client,
+                        self.policy.clone());
                 }
 
                 Ok(fulfill)
@@ -199,24 +191,23 @@ where
     }
 }
 
-fn settle_or_rollback_later<Acct, Store>(incoming_amount: u64, outgoing_amount: u64, store: Store, from_id: Uuid, to: Acct, settlement_client: SettlementClient)
+fn settle_or_rollback_later<Acct, Store>(incoming_amount: u64, outgoing_amount: u64, store: Store, from_id: Uuid, to: Acct, settlement_client: SettlementClient, policy: Policy)
     where Acct: SettlementAccount + Send + Sync + 'static,
           Store: BalanceStore + SettlementStore<Account = Acct> + Send + Sync + 'static,
 {
-    tokio::spawn(settle_or_rollback_now(incoming_amount, outgoing_amount, store, from_id, to, settlement_client, ()));
+    tokio::spawn(settle_or_rollback_now(incoming_amount, outgoing_amount, store, from_id, to, settlement_client, policy));
 }
 
-async fn settle_or_rollback_now<Acct, Store, Timing>(
+async fn settle_or_rollback_now<Acct, Store>(
     incoming_amount: u64,
     outgoing_amount: u64,
     store: Store,
     from_id: Uuid,
     to: <Store as SettlementStore>::Account,
     settlement_client: SettlementClient,
-    timing: Timing) -> Result<(), ()>
+    policy: Policy) -> Result<(), ()>
     where Acct: SettlementAccount + Send + Sync + 'static,
           Store: BalanceStore + SettlementStore<Account = Acct> + Send + Sync + 'static,
-          Timing: SettlementTimeouts + Send + Sync + 'static,
 {
     let (balance, amount_to_settle) = store
         .update_balances_for_fulfill(to.id(), outgoing_amount)
@@ -242,13 +233,13 @@ async fn settle_or_rollback_now<Acct, Store, Timing>(
             //
             // the new settlement thing will need to settle any balance x to settle_to,
             // where x >= settle_to
-            timing.settle_later(to.id());
+            policy.settle_later(to.id());
         }
         return Ok(());
     }
 
     // cancel a pending settlement always before trying it
-    timing.clear_later(to.id());
+    policy.clear_later(to.id());
 
     settle_or_rollback(store, to, amount_to_settle, settlement_client).await
 }
@@ -296,10 +287,8 @@ async fn settle_or_rollback<Store, Acct>(store: Store, to: Acct, amount: u64, cl
 
 /// Wrapper for a type which handles the communication with a task handling the delayed settlement,
 /// if any.
-trait SettlementTimeouts {
-    /// Called to clear a pending timeout, if there's any
+pub trait SettlementTimeouts {
     fn clear_later(&self, account_id: Uuid);
-    /// Called to signal this account id needs to be settled later
     fn settle_later(&self, account_id: Uuid);
 }
 
@@ -308,15 +297,42 @@ impl SettlementTimeouts for () {
     fn settle_later(&self, _: Uuid) { todo!() }
 }
 
-enum ManageTimeout {
+#[derive(Debug, Clone)]
+enum Policy {
+    ThresholdOnly,
+    TimeBased(tokio::sync::mpsc::UnboundedSender<ManageTimeout>),
+}
+
+impl SettlementTimeouts for Policy {
+    /// Called to clear a pending timeout, if there's any
+    fn clear_later(&self, account_id: Uuid) {
+        match *self {
+            Policy::ThresholdOnly => {},
+            Policy::TimeBased(ref sender) => { let _ = sender.send(ManageTimeout::Clear(account_id)); },
+            // FIXME: not sure what do with an error, like it's a quite bad situation
+        }
+
+    }
+
+    /// Called to signal this account id needs to be settled later
+    fn settle_later(&self, account_id: Uuid) {
+        match *self {
+            Policy::ThresholdOnly => {},
+            Policy::TimeBased(ref sender) => { let _ = sender.send(ManageTimeout::Set(account_id)); },
+            // FIXME: not sure what do with an error, like it's a quite bad situation
+        }
+    }
+}
+
+pub enum ManageTimeout {
     Clear(Uuid),
     Set(Uuid),
 }
 
+// FIXME: this can probably go
 impl SettlementTimeouts for tokio::sync::mpsc::UnboundedSender<ManageTimeout> {
     fn clear_later(&self, account_id: Uuid) {
         let _ = self.send(ManageTimeout::Clear(account_id));
-        // FIXME: not sure what do with an error, like it's a quite bad situation
     }
 
     fn settle_later(&self, account_id: Uuid) {
@@ -347,8 +363,21 @@ impl fmt::Display for ExitReason {
     }
 }
 
-async fn run_timeouts_and_settle_on_delay<St, Store, Acct>(delay: Duration, cmds: St, store: Store, client: SettlementClient) -> ExitReason
-    where St: futures::stream::FusedStream<Item = ManageTimeout> + Unpin,
+pub async fn start_delayed_settlement<St, Store, Acct>(delay: Duration, cmds: St, store: Store) -> tokio::task::JoinHandle<()>
+    where St: futures::stream::FusedStream<Item = ManageTimeout> + Send + Sync + 'static + Unpin,
+          Store: BalanceStore + SettlementStore<Account = Acct> + AccountStore<Account = Acct> + Clone + Send + Sync + 'static,
+          Acct: SettlementAccount + Send + Sync + 'static,
+{
+    let client = SettlementClient::default();
+    tokio::spawn(async move {
+        let exit_reason = run_timeouts_and_settle_on_delay(delay, cmds, store, client).await;
+
+        info!("Stopped running timeouts and delayed settlements: {}", exit_reason);
+    })
+}
+
+async fn run_timeouts_and_settle_on_delay<St, Store, Acct>(delay: Duration, mut cmds: St, store: Store, client: SettlementClient) -> ExitReason
+    where St: futures::stream::FusedStream<Item = ManageTimeout> + Send + Sync + 'static + Unpin,
           Store: BalanceStore + SettlementStore<Account = Acct> + AccountStore<Account = Acct> + Clone + Send + Sync + 'static,
           Acct: SettlementAccount + Send + Sync + 'static,
 {
@@ -356,7 +385,6 @@ async fn run_timeouts_and_settle_on_delay<St, Store, Acct>(delay: Duration, cmds
     use tokio::time::DelayQueue;
     use tokio::stream::StreamExt;
 
-    let mut cmds = cmds.fuse();
     let mut timeouts = DelayQueue::new();
     let mut in_queue = HashMap::new();
 
@@ -391,9 +419,6 @@ async fn run_timeouts_and_settle_on_delay<St, Store, Acct>(delay: Duration, cmds
                         let client = client.clone();
                         let store = store.clone();
 
-                        // FIXME: spawn to update database and notify the engine
-                        //  * how to load an account by id
-                        //  * need a clone of SettlementClient, probably with an argument
                         tokio::spawn(async move {
                             // TODO: this operation must be implemented elsewhere as well
                             let to = match store.get_accounts(vec![id.clone()]).await {
@@ -405,7 +430,7 @@ async fn run_timeouts_and_settle_on_delay<St, Store, Acct>(delay: Duration, cmds
                                         "Asked for account {} for delayed settlement got back {} accounts: {:?}",
                                         id, accounts.len(), accounts
                                     );
-                                    return Ok(());
+                                    return Err(());
                                 }
                                 Err(e) => {
                                     warn!(
