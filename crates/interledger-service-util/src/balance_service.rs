@@ -404,23 +404,23 @@ async fn run_timeouts_and_settle_on_delay<St, Store, Acct>(delay: Duration, mut 
                             // elsewhere as well, couldn't find
                             let to = match store.get_accounts(vec![id]).await {
                                 Ok(mut accounts) if accounts.len() == 1 => {
-                                    accounts.pop().unwrap()
+                                    Ok(accounts.pop().unwrap())
                                 },
                                 Ok(accounts) => {
                                     error!(
                                         "Asked for account {} for delayed settlement got back {} accounts: {:?}",
                                         id, accounts.len(), accounts
                                     );
-                                    return Err(());
+                                    Err(())
                                 }
                                 Err(e) => {
                                     warn!(
                                         "Failed to load account {} for time based settlement: {}",
                                         id, e
                                     );
-                                    return Err(());
+                                    Err(())
                                 }
-                            };
+                            }?;
 
                             let (balance, amount_to_settle) = store.update_balances_for_delayed_settlement(id).await
                                 .map_err(|e| warn!("Time based settlement failed for {}: {}", id, e))?;
