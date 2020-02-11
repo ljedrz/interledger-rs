@@ -41,7 +41,7 @@ pub trait BalanceStore {
         incoming_amount: u64,
     ) -> Result<(), BalanceStoreError>;
 
-    async fn update_balances_for_delayed_settling(
+    async fn update_balances_for_delayed_settlement(
         &self,
         to_account_id: Uuid
     ) -> Result<(i64, u64), BalanceStoreError>;
@@ -60,9 +60,6 @@ impl std::default::Default for Policy {
         Policy::AsSoonAsPossible
     }
 }
-
-
-
 
 /// # Balance Service
 ///
@@ -250,13 +247,13 @@ async fn settle_or_rollback_now<Acct, Store, Timing>(
         return Ok(());
     }
 
-    // FIXME: maybe cancel any timeout here?
+    // cancel a pending settlement always before trying it
     timing.clear_later(to.id());
 
-    settle(store, to, amount_to_settle, settlement_client).await
+    settle_or_rollback(store, to, amount_to_settle, settlement_client).await
 }
 
-async fn settle<Store, Acct>(store: Store, to: Acct, amount: u64, client: SettlementClient) -> Result<(), ()>
+async fn settle_or_rollback<Store, Acct>(store: Store, to: Acct, amount: u64, client: SettlementClient) -> Result<(), ()>
     where Store: BalanceStore + SettlementStore<Account = Acct> + 'static,
           Acct: SettlementAccount + 'static,
 {
@@ -297,6 +294,8 @@ async fn settle<Store, Acct>(store: Store, to: Acct, amount: u64, client: Settle
     Ok(())
 }
 
+/// Wrapper for a type which handles the communication with a task handling the delayed settlement,
+/// if any.
 trait SettlementTimeouts {
     /// Called to clear a pending timeout, if there's any
     fn clear_later(&self, account_id: Uuid);
@@ -328,6 +327,7 @@ impl SettlementTimeouts for tokio::sync::mpsc::UnboundedSender<ManageTimeout> {
 
 #[derive(Debug)]
 enum ExitReason {
+    InputClosed,
     Shutdown,
     Capacity,
     Other(tokio::time::Error),
@@ -339,6 +339,7 @@ impl fmt::Display for ExitReason {
     fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
         use ExitReason::*;
         match *self {
+            InputClosed => write!(fmt, "Input was closed and ran out of timed settlements"),
             Shutdown => write!(fmt, "Tokio is shutting down"),
             Capacity => write!(fmt, "Timer service is over capacity"),
             Other(ref e) => write!(fmt, "Other: {}", e),
@@ -346,8 +347,8 @@ impl fmt::Display for ExitReason {
     }
 }
 
-async fn run_timeouts_and_settle_on_delay<St, Store, Acct>(delay: Duration, cmds: St, store: Store) -> ExitReason
-    where St: tokio::stream::Stream<Item = ManageTimeout> + Unpin,
+async fn run_timeouts_and_settle_on_delay<St, Store, Acct>(delay: Duration, cmds: St, store: Store, client: SettlementClient) -> ExitReason
+    where St: futures::stream::FusedStream<Item = ManageTimeout> + Unpin,
           Store: BalanceStore + SettlementStore<Account = Acct> + AccountStore<Account = Acct> + Clone + Send + Sync + 'static,
           Acct: SettlementAccount + Send + Sync + 'static,
 {
@@ -355,8 +356,6 @@ async fn run_timeouts_and_settle_on_delay<St, Store, Acct>(delay: Duration, cmds
     use tokio::time::DelayQueue;
     use tokio::stream::StreamExt;
 
-    let client: SettlementClient = todo!();
-    let store: Store = todo!();
     let mut cmds = cmds.fuse();
     let mut timeouts = DelayQueue::new();
     let mut in_queue = HashMap::new();
@@ -375,7 +374,7 @@ async fn run_timeouts_and_settle_on_delay<St, Store, Acct>(delay: Duration, cmds
                         }
                     }
                     Some(ManageTimeout::Set(id)) => {
-                        let in_queue = &mut in_queue;
+                        let timeouts = &mut timeouts;
                         in_queue.entry(id.clone()).or_insert_with(move || timeouts.insert(id, delay));
                     }
                     None => {
@@ -417,7 +416,7 @@ async fn run_timeouts_and_settle_on_delay<St, Store, Acct>(delay: Duration, cmds
                                 }
                             };
 
-                            let (balance, amount_to_settle) = store.update_balances_for_delayed_settling(id.clone()).await
+                            let (balance, amount_to_settle) = store.update_balances_for_delayed_settlement(id.clone()).await
                                 .map_err(|e| warn!("Time based settlement failed for {}: {}", id, e))?;
 
                             debug!(
@@ -425,9 +424,7 @@ async fn run_timeouts_and_settle_on_delay<St, Store, Acct>(delay: Duration, cmds
                                 to.id(), balance, amount_to_settle
                             );
 
-                            settle(store, to, amount_to_settle, client).await
-
-                            // store.update_balance_on_timed_settling() -> Result<amount_to_settle>
+                            settle_or_rollback(store, to, amount_to_settle, client).await
                         });
                     },
                     Some(Err(e)) if e.is_shutdown() => {
@@ -443,6 +440,9 @@ async fn run_timeouts_and_settle_on_delay<St, Store, Acct>(delay: Duration, cmds
                     }
                     None => {
                         // no more timeouts currently
+                        if input_closed {
+                            return ExitReason::InputClosed;
+                        }
                     }
                 }
             }
