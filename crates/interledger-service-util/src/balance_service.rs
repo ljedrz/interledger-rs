@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::{fmt, time::Duration};
 use async_trait::async_trait;
 use futures::TryFutureExt;
 use interledger_errors::BalanceStoreError;
@@ -191,6 +191,7 @@ where
     }
 }
 
+// See comments above in the BalanceStore::send_request why this is done in another task.
 fn settle_or_rollback_later<Acct, Store>(incoming_amount: u64, outgoing_amount: u64, store: Store, from_id: Uuid, to: Acct, settlement_client: SettlementClient, policy: Policy)
     where Acct: SettlementAccount + Send + Sync + 'static,
           Store: BalanceStore + SettlementStore<Account = Acct> + Send + Sync + 'static,
@@ -285,25 +286,16 @@ async fn settle_or_rollback<Store, Acct>(store: Store, to: Acct, amount: u64, cl
     Ok(())
 }
 
-/// Wrapper for a type which handles the communication with a task handling the delayed settlement,
-/// if any.
-pub trait SettlementTimeouts {
-    fn clear_later(&self, account_id: Uuid);
-    fn settle_later(&self, account_id: Uuid);
-}
-
-impl SettlementTimeouts for () {
-    fn clear_later(&self, _: Uuid) { todo!() }
-    fn settle_later(&self, _: Uuid) { todo!() }
-}
-
+/// Captures the behaviour of either operating in a delayed settlement or threshold-only
+/// environment.
+// Tried to go with this as a trait first but perhaps it works better as an enum.
 #[derive(Debug, Clone)]
 enum Policy {
     ThresholdOnly,
     TimeBased(tokio::sync::mpsc::UnboundedSender<ManageTimeout>),
 }
 
-impl SettlementTimeouts for Policy {
+impl Policy {
     /// Called to clear a pending timeout, if there's any
     fn clear_later(&self, account_id: Uuid) {
         match *self {
@@ -324,21 +316,11 @@ impl SettlementTimeouts for Policy {
     }
 }
 
+/// When configured to operate with time based settlement `ManageTimeout` models the commands sent
+/// over to background task to manage the timeouts.
 pub enum ManageTimeout {
     Clear(Uuid),
     Set(Uuid),
-}
-
-// FIXME: this can probably go
-impl SettlementTimeouts for tokio::sync::mpsc::UnboundedSender<ManageTimeout> {
-    fn clear_later(&self, account_id: Uuid) {
-        let _ = self.send(ManageTimeout::Clear(account_id));
-    }
-
-    fn settle_later(&self, account_id: Uuid) {
-        let _ = self.send(ManageTimeout::Set(account_id));
-        // FIXME: error again
-    }
 }
 
 #[derive(Debug)]
@@ -348,8 +330,6 @@ enum ExitReason {
     Capacity,
     Other(tokio::time::Error),
 }
-
-use std::fmt;
 
 impl fmt::Display for ExitReason {
     fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
