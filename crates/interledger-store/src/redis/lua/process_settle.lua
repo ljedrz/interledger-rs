@@ -7,7 +7,7 @@ local to_account = 'accounts:' .. ARGV[1]
 local balance, prepaid_amount, settle_threshold, settle_to = unpack(redis.call('HMGET', to_account, 'balance', 'prepaid_amount', 'settle_threshold', 'settle_to'))
 local settle_amount = 0
 
-if (settle_threshold and settle_to) and (tonumber(settle_threshold) > tonumber(settle_to)) then
+if (settle_threshold and settle_to) and (tonumber(settle_threshold) > tonumber(settle_to)) and tonumber(balance) > tonumber(settle_to) then
     settle_amount = balance - tonumber(settle_to)
     balance = settle_to
     redis.call('HSET', to_account, 'balance', balance)
