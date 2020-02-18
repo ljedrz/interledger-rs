@@ -393,7 +393,6 @@ async fn run_timeouts_and_settle_on_delay<St, Store, Acct>(delay: Duration, mut 
                             // this should only be removed when the settle_threshold was achieved
                             // while processing a fulfill.
                             timeouts.remove(&key);
-
                             trace!("Cleared pending settlement timeout for account: {}", id);
                         }
                     }
@@ -472,10 +471,6 @@ async fn run_timeouts_and_settle_on_delay<St, Store, Acct>(delay: Duration, mut 
                         return ExitReason::InputClosed;
                     }
                 }
-            }
-            else => {
-                // FIXME: should just poll select_next_some
-                tokio::task::yield_now().await
             }
         }
     }
