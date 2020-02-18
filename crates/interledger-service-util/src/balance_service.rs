@@ -8,7 +8,7 @@ use interledger_settlement::core::{
     types::{SettlementAccount, SettlementStore},
     SettlementClient,
 };
-use log::{debug, info, warn, error};
+use log::{trace, debug, info, warn, error};
 use std::marker::PhantomData;
 use uuid::Uuid;
 
@@ -287,6 +287,8 @@ async fn settle_or_rollback<Store, Acct>(store: Store, to: Acct, amount: u64, cl
                         "Refunding account {} after failed settlement failed, amount: {}: {}",
                         to.id(), amount, e))
                 .await?;
+        } else {
+            info!("Settlement for account {} for {} succeeded", to.id(), amount);
         }
     } else {
         debug!("Settlement for account {} for {} failed as the account has no settlement-engine details",
@@ -360,6 +362,8 @@ pub fn start_delayed_settlement<St, Store, Acct>(delay: Duration, cmds: St, stor
 {
     let client = SettlementClient::default();
     tokio::spawn(async move {
+        info!("Starting to run delayed settlements with timeout of {:?}", delay);
+
         let exit_reason = run_timeouts_and_settle_on_delay(delay, cmds, store, client).await;
 
         info!("Stopped running timeouts and delayed settlements: {}", exit_reason);
@@ -388,15 +392,29 @@ async fn run_timeouts_and_settle_on_delay<St, Store, Acct>(delay: Duration, mut 
                         let key = in_queue.remove(&id);
 
                         if let Some(key) = key {
+                            // this should only be removed when the settle_threshold was achieved
+                            // while processing a fulfill.
                             timeouts.remove(&key);
+
+                            trace!("Cleared pending settlement timeout for account: {}", id);
                         }
                     }
                     Some(ManageTimeout::Set(id)) => {
                         let timeouts = &mut timeouts;
-                        in_queue.entry(id).or_insert_with(move || timeouts.insert(id, delay));
+                        in_queue.entry(id).or_insert_with(move || {
+                            let key = timeouts.insert(id, delay);
+
+                            trace!("Setting pending settlement timeout for account: {}", id);
+
+                            key
+                        });
                     }
                     None => {
-                        input_closed = true;
+                        if !input_closed {
+                            input_closed = true;
+
+                            trace!("Timeout management stream closed");
+                        }
                     }
                 }
             },
@@ -405,6 +423,8 @@ async fn run_timeouts_and_settle_on_delay<St, Store, Acct>(delay: Duration, mut 
                     Some(Ok(expired)) => {
                         let id = expired.into_inner();
                         in_queue.remove(&id); // unsure if this can ever be none
+
+                        trace!("Delayed settlement for account {} expired", id);
 
                         let client = client.clone();
                         let store = store.clone();
@@ -466,7 +486,7 @@ async fn run_timeouts_and_settle_on_delay<St, Store, Acct>(delay: Duration, mut 
                 }
             }
             else => {
-                // without this the runtime will be blocked here ... but still is
+                // FIXME: should just poll select_next_some
                 tokio::task::yield_now().await
             }
         }
