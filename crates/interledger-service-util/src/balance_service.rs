@@ -457,10 +457,17 @@ async fn run_timeouts_and_settle_on_delay<St, Store, Acct>(delay: Duration, mut 
                     None => {
                         // no more timeouts currently
                         if input_closed {
+                            // no more timeouts ever
                             return ExitReason::InputClosed;
+                        } else {
+                            tokio::task::yield_now().await
                         }
                     }
                 }
+            }
+            else => {
+                // without this the runtime will be blocked here ... but still is
+                tokio::task::yield_now().await
             }
         }
     }
