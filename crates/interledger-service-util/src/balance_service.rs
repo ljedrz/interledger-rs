@@ -377,18 +377,16 @@ async fn run_timeouts_and_settle_on_delay<St, Store, Acct>(delay: Duration, mut 
 {
     use std::collections::HashMap;
     use tokio::time::DelayQueue;
-    use tokio::stream::StreamExt;
+    use futures::stream::StreamExt;
 
     let mut timeouts = DelayQueue::new();
     let mut in_queue = HashMap::new();
 
-    let mut input_closed = false;
-
     loop {
         tokio::select! {
-            cmd = cmds.next() => {
+            cmd = cmds.select_next_some() => {
                 match cmd {
-                    Some(ManageTimeout::Clear(id)) => {
+                    ManageTimeout::Clear(id) => {
                         let key = in_queue.remove(&id);
 
                         if let Some(key) = key {
@@ -399,7 +397,7 @@ async fn run_timeouts_and_settle_on_delay<St, Store, Acct>(delay: Duration, mut 
                             trace!("Cleared pending settlement timeout for account: {}", id);
                         }
                     }
-                    Some(ManageTimeout::Set(id)) => {
+                    ManageTimeout::Set(id) => {
                         let timeouts = &mut timeouts;
                         in_queue.entry(id).or_insert_with(move || {
                             let key = timeouts.insert(id, delay);
@@ -409,16 +407,9 @@ async fn run_timeouts_and_settle_on_delay<St, Store, Acct>(delay: Duration, mut 
                             key
                         });
                     }
-                    None => {
-                        if !input_closed {
-                            input_closed = true;
-
-                            trace!("Timeout management stream closed");
-                        }
-                    }
                 }
             },
-            next = timeouts.next() => {
+            next = timeouts.next(), if !timeouts.is_empty() || cmds.is_terminated() => {
                 match next {
                     Some(Ok(expired)) => {
                         let id = expired.into_inner();
@@ -476,12 +467,9 @@ async fn run_timeouts_and_settle_on_delay<St, Store, Acct>(delay: Duration, mut 
                     }
                     None => {
                         // no more timeouts currently
-                        if input_closed {
-                            // no more timeouts ever
-                            return ExitReason::InputClosed;
-                        } else {
-                            tokio::task::yield_now().await
-                        }
+                        assert!(cmds.is_terminated());
+                        // no more timeouts ever
+                        return ExitReason::InputClosed;
                     }
                 }
             }
