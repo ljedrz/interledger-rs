@@ -353,7 +353,7 @@ impl fmt::Display for ExitReason {
     }
 }
 
-pub async fn start_delayed_settlement<St, Store, Acct>(delay: Duration, cmds: St, store: Store) -> tokio::task::JoinHandle<()>
+pub fn start_delayed_settlement<St, Store, Acct>(delay: Duration, cmds: St, store: Store) -> tokio::task::JoinHandle<()>
     where St: futures::stream::FusedStream<Item = ManageTimeout> + Send + Sync + 'static + Unpin,
           Store: BalanceStore + SettlementStore<Account = Acct> + AccountStore<Account = Acct> + Clone + Send + Sync + 'static,
           Acct: SettlementAccount + Send + Sync + 'static,
