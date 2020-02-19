@@ -41,6 +41,12 @@ pub trait BalanceStore {
         incoming_amount: u64,
     ) -> Result<(), BalanceStoreError>;
 
+    /// Removes any positive amount to settle over `settle_to` from `balance`. Similarly to other
+    /// balance updates once this call succeeds the amount needed to be settled is only in the
+    /// interledger node so crashing while the HTTP request to settlement-engine hasn't gone
+    /// through or this balance hasn't been refunded will lead to loss of the "amount to settle".
+    ///
+    /// Returns (balance, amount_to_settle).
     async fn update_balances_for_delayed_settlement(
         &self,
         to_account_id: Uuid
