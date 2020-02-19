@@ -387,10 +387,10 @@ impl InterledgerNode {
         let outgoing_service = match self.settle_every {
                 Some(seconds) => {
                     use futures::stream::StreamExt;
-                    let delay = Duration::from_secs(seconds.get() as u64);
+                    let delay = Duration::from_secs(seconds.get().into());
                     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
 
-                    drop(start_delayed_settlement(delay, rx.fuse(), store.clone()));
+                    start_delayed_settlement(delay, rx.fuse(), store.clone());
 
                     BalanceService::new(store.clone(), Some(tx), outgoing_service)
                 },
