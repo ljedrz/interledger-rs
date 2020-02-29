@@ -61,7 +61,7 @@ use interledger::{
 use num_bigint::BigUint;
 use once_cell::sync::Lazy;
 use serde::{de::Error as DeserializeError, Deserialize, Deserializer};
-use std::{convert::TryFrom, net::SocketAddr, str, str::FromStr, time::Duration};
+use std::{convert::TryFrom, net::SocketAddr, str, str::FromStr, time::Duration, num::NonZeroU32};
 use tokio::spawn;
 use tracing::{debug, error, info};
 use url::Url;
@@ -71,7 +71,7 @@ use warp::{self, Filter};
 #[cfg(feature = "redis")]
 use crate::redis_store::*;
 #[cfg(feature = "balance-tracking")]
-use interledger::service_util::BalanceService;
+use interledger::service_util::{BalanceService, start_delayed_settlement};
 
 #[doc(hidden)]
 pub use interledger::rates::ExchangeRateProvider;
@@ -218,6 +218,10 @@ pub struct InterledgerNode {
     pub prometheus: Option<PrometheusConfig>,
     #[cfg(feature = "google-pubsub")]
     pub google_pubsub: Option<PubsubConfig>,
+    /// The delay in seconds to settle peering account to `settle_to` level in addition to settling
+    /// the account when it exceeds the settlement threshold.
+    #[cfg(feature = "balance-tracking")]
+    pub settle_every: Option<NonZeroU32>,
 }
 
 impl InterledgerNode {
@@ -378,8 +382,23 @@ impl InterledgerNode {
         let outgoing_service = ExpiryShortenerService::new(outgoing_service);
         let outgoing_service =
             StreamReceiverService::new(secret_seed.clone(), store.clone(), outgoing_service);
+
         #[cfg(feature = "balance-tracking")]
-        let outgoing_service = BalanceService::new(store.clone(), outgoing_service);
+        let outgoing_service = match self.settle_every {
+                Some(seconds) => {
+                    use futures::stream::StreamExt;
+                    let delay = Duration::from_secs(seconds.get().into());
+                    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+
+                    start_delayed_settlement(delay, rx.fuse(), store.clone());
+
+                    BalanceService::new(store.clone(), Some(tx), outgoing_service)
+                },
+                None => {
+                    BalanceService::new(store.clone(), None, outgoing_service)
+                }
+        };
+
         let outgoing_service =
             ExchangeRateService::new(exchange_rate_spread, store.clone(), outgoing_service);
 
