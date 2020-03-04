@@ -1,7 +1,7 @@
 FROM rust:1.40 as cargo-build
 COPY . /interledger
 WORKDIR /interledger
-RUN cargo build --bin ilp-node --release
+RUN cargo build --release --all-features --package ilp-node
 
 FROM ubuntu:19.04
 WORKDIR /interledger
