@@ -1,4 +1,4 @@
-FROM rust:1.40 as cargo-build
+FROM rust:1.41 as cargo-build
 COPY . /interledger
 WORKDIR /interledger
 RUN cargo build --release --all-features --package ilp-node
