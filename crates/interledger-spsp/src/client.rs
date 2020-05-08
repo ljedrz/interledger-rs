@@ -75,7 +75,7 @@ where
 }
 
 fn payment_pointer_to_url(payment_pointer: &str) -> String {
-    let mut url: String = if payment_pointer.starts_with('$') {
+    let url: String = if payment_pointer.starts_with('$') {
         let mut url = "https://".to_string();
         url.push_str(&payment_pointer[1..]);
         url
@@ -83,12 +83,6 @@ fn payment_pointer_to_url(payment_pointer: &str) -> String {
         payment_pointer.to_string()
     };
 
-    let num_slashes = url.matches('/').count();
-    if num_slashes == 2 {
-        url.push_str("/.well-known/pay");
-    } else if num_slashes == 1 && url.ends_with('/') {
-        url.push_str(".well-known/pay");
-    }
     trace!(
         "Converted payment pointer: {} to URL: {}",
         payment_pointer,
@@ -106,7 +100,7 @@ mod payment_pointer {
         let pointer = "$subdomain.domain.example";
         assert_eq!(
             payment_pointer_to_url(pointer),
-            "https://subdomain.domain.example/.well-known/pay"
+            "https://subdomain.domain.example"
         );
     }
 }
